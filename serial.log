@@ -1,0 +1,16 @@
+S2.A20.GDT.PM.CPK.JMP 00100240
+=== NovaOS kernel ===
+  [ OK ] cpu    - protected mode, 32-bit
+  [ OK ] video  - 1024x768x32 LFB (VBE driver)
+  [ OK ] com1   - 115200 8N1
+  [ OK ] novafs - mounted
+  [ OK ] acpi   - \_S5 found, poweroff ready
+  [ OK ] input  - keyboard + PS/2 mouse
+  [ OK ] ring3  - paging + TSS + IDT, user mode ready
+
+Type 'help' for a list of commands.
+
+novaos:/# shutshutdown
+[shutdown] start
+SHUTDOWN_REQUEST
+[shutdown] ACPI: PM1a=0x00000604 PM1b=0x00000000  _S5: a=0 b=0
