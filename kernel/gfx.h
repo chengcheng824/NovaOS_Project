@@ -28,6 +28,7 @@ void gfx_putc(char c);
 void gfx_puts(const char *s);
 void gfx_clear(void);
 void gfx_set_colors(uint8_t fg_idx, uint8_t bg_idx);   /* VGA 16-color idx */
+void gfx_set_bg_rgb(uint32_t rgb);  /* set raw RGB background (for BSOD) */
 void gfx_move_cursor(void);
 void gfx_grad_bar(void);   /* true-color gradient bar, one text row tall */
 /* draw one font glyph at pixel coords with integer scale */

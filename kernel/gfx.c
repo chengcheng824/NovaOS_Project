@@ -263,6 +263,8 @@ void gfx_putc(char c)
                                                  * cursor — newline writes no
                                                  * glyph here. */
         cur_x = 0; cur_y++;
+    } else if (c == '\r') {
+        cur_x = 0;
     } else if (c == '\b') {
         if (cur_x > 0) cur_x--;
         draw_cell(cur_x, cur_y);                /* erase glyph + refresh bg */
@@ -288,11 +290,17 @@ void gfx_set_colors(uint8_t fg_idx, uint8_t bg_idx)
     bg_col = pal[bg_idx_cur];
 }
 
+void gfx_set_bg_rgb(uint32_t rgb)
+{
+    bg_col = rgb;
+}
+
 void gfx_clear(void)
 {
     uint32_t n = (uint32_t)SCR_W * SCR_H;
     for (uint32_t i = 0; i < n; i++) fb[i] = bg_col;
     cur_x = cur_y = 0;
+    gfx_move_cursor();
 }
 
 void gfx_grad_bar(void)

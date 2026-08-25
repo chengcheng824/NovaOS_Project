@@ -7,6 +7,7 @@
  *     binaries keep working unmodified (same nxp_api_t layout)
  * ============================================================ */
 #include "paging.h"
+#include "gfx.h"
 
 /* console helpers from kernel.c (non-static there) */
 extern void kput(char c);
@@ -15,8 +16,7 @@ extern void kput_hex(unsigned v);
 
 /* asm helpers from entry.asm */
 extern void isr_syscall(void);
-extern void isr_fault_err(void);
-extern void isr_fault_noerr(void);
+extern uint32_t isr_fault_table[];   /* 32 stub addresses */
 void ring3_leave(void);
 
 /* ---- fixed placements (linker gives only 16-byte alignment) ---- */
@@ -85,20 +85,112 @@ void syscall_dispatch(regs_t *r)
     r->r[7] = ret;                              /* return value -> EAX */
 }
 
-void fault_dispatch(regs_t *r)   /* any exception 0..31, never returns */
+/* ---- BSOD (red screen of death) ---- */
+#define BSOD_BG   0x00FF0000u          /* pure bright red */
+#define BSOD_FG   0x00FFFFFFu          /* white */
+
+static const char * const exc_name[32] = {
+    "#DE Divide Error",        "#DB Debug",            "NMI",                    "#BP Breakpoint",
+    "#OF Overflow",            "#BR Bound Range",      "#UD Invalid Opcode",     "#NM Device N/A",
+    "#DF Double Fault",        "CoSeg Overrun",        "#TS Invalid TSS",        "#NP Seg Not Present",
+    "#SS Stack Fault",         "#GP General Protection","#PF Page Fault",        "Reserved",
+    "#MF x87 FPU Error",      "#AC Alignment Check",  "#MC Machine Check",      "#XM SIMD Exception",
+    "#VE Virtualization",     "#CP Control Protection","Reserved",              "Reserved",
+    "Reserved",               "Reserved",              "Reserved",               "Reserved",
+    "Reserved",               "Reserved",              "Reserved",               "Reserved",
+};
+
+/* format "0xXXXXXXXX" into buf (11 bytes incl nul) */
+static int fmt_hex(char *buf, uint32_t v)
+{
+    static const char h[] = "0123456789ABCDEF";
+    buf[0]='0'; buf[1]='x';
+    for (int i = 0; i < 8; i++) buf[2+i] = h[(v >> (28 - i*4)) & 0xF];
+    buf[10] = 0;
+    return 10;
+}
+
+/* append string, return new length */
+static int app_str(char *buf, int n, const char *s)
+{
+    while (*s) buf[n++] = *s++;
+    buf[n] = 0;
+    return n;
+}
+
+static void bsod_show(regs_t *r, uint32_t vector, uint32_t cr2)
+{
+    char line[80];
+    int  n;
+
+    /* serial dump first (kputs also hits VGA but we overwrite it next) */
+    kputs("\n!!! FATAL: "); kputs(exc_name[vector & 31]); kputs(" !!!\n");
+    kputs("EIP="); kput_hex(r->r[9]); kputs(" ERR="); kput_hex(r->r[8]);
+    kputs(" CR2="); kput_hex(cr2); kputs("\n");
+    kputs("EAX="); kput_hex(r->r[7]); kputs(" EBX="); kput_hex(r->r[4]);
+    kputs(" ECX="); kput_hex(r->r[6]); kputs(" EDX="); kput_hex(r->r[5]); kputs("\n");
+    kputs("ESI="); kput_hex(r->r[1]); kputs(" EDI="); kput_hex(r->r[0]);
+    kputs(" EBP="); kput_hex(r->r[2]); kputs(" ESP="); kput_hex(r->r[3]); kputs("\n");
+    kputs("CS=");  kput_hex(r->r[10]); kputs(" EFL="); kput_hex(r->r[11]); kputs("\n");
+
+    if (gfx_active()) {
+        /* fill screen with pure bright red + set text bg */
+        gfx_set_bg_rgb(BSOD_BG);
+        gfx_clear();
+
+        int y = 80;
+        gfx_text(460, y, ":(", BSOD_FG);                   y += 60;
+        gfx_text(200, y, "NovaOS ran into a problem and needs to halt.", BSOD_FG);  y += 28;
+        gfx_text(240, y, "We're collecting fault info, then stopping for you.", BSOD_FG); y += 50;
+
+        /* exception name */
+        gfx_text(200, y, exc_name[vector & 31], BSOD_FG);  y += 40;
+
+        /* EIP / ERR / CR2 */
+        n = app_str(line, 0, "EIP: ");   n += fmt_hex(line+n, r->r[9]);
+        n = app_str(line, n, "   ERR: "); n += fmt_hex(line+n, r->r[8]);
+        n = app_str(line, n, "   CR2: "); n += fmt_hex(line+n, cr2);
+        gfx_text(200, y, line, BSOD_FG);  y += 25;
+
+        /* CS / EFLAGS */
+        n = app_str(line, 0, "CS:  ");    n += fmt_hex(line+n, r->r[10]);
+        n = app_str(line, n, "   EFL: "); n += fmt_hex(line+n, r->r[11]);
+        gfx_text(200, y, line, BSOD_FG);  y += 40;
+
+        /* registers */
+        gfx_text(200, y, "Registers:", BSOD_FG);  y += 25;
+        n = app_str(line, 0, "EAX: "); n += fmt_hex(line+n, r->r[7]);
+        n = app_str(line, n, "  EBX: "); n += fmt_hex(line+n, r->r[4]);
+        n = app_str(line, n, "  ECX: "); n += fmt_hex(line+n, r->r[6]);
+        n = app_str(line, n, "  EDX: "); n += fmt_hex(line+n, r->r[5]);
+        gfx_text(200, y, line, BSOD_FG);  y += 25;
+        n = app_str(line, 0, "ESI: "); n += fmt_hex(line+n, r->r[1]);
+        n = app_str(line, n, "  EDI: "); n += fmt_hex(line+n, r->r[0]);
+        n = app_str(line, n, "  EBP: "); n += fmt_hex(line+n, r->r[2]);
+        n = app_str(line, n, "  ESP: "); n += fmt_hex(line+n, r->r[3]);
+        gfx_text(200, y, line, BSOD_FG);  y += 50;
+
+        gfx_text(300, y, "Halted. Power off to restart.", BSOD_FG);
+    }
+}
+
+void fault_dispatch(regs_t *r, uint32_t vector)   /* exception 0..31, never returns */
 {
     uint32_t cr2;
     __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+
     if ((r->r[10] & 3) == 3) {                  /* fault in Ring 3 */
-        kputs("\n[nxp] user fault: eip=");  kput_hex(r->r[9]);
-        kputs(" err=");                    kput_hex(r->r[8]);
-        kputs(" cr2=");                    kput_hex(cr2);
+        kputs("\n[nxp] user fault: ");
+        kputs(exc_name[vector & 31]);
+        kputs("  eip=");  kput_hex(r->r[9]);
+        kputs(" err=");   kput_hex(r->r[8]);
+        kputs(" cr2=");   kput_hex(cr2);
         kput('\n');
         ring3_leave();                          /* kill the program */
     }
-    kputs("\n!!! KERNEL FAULT: eip=");      kput_hex(r->r[9]);
-    kputs(" err=");                        kput_hex(r->r[8]);
-    kputs(" cr2=");                        kput_hex(cr2); kput('\n');
+
+    /* kernel fault — show BSOD and halt */
+    bsod_show(r, vector, cr2);
     __asm__ volatile ("cli");
     for (;;) __asm__ volatile ("hlt");
 }
@@ -207,8 +299,7 @@ void ring3_init(const void *api_table)
     *(uint16_t *)&tss[102] = 104;               /* IOPB: deny all ports */
 
     for (int i = 0; i < 32; i++) {
-        int err = (i == 8) || (i >= 10 && i <= 14) || i == 17 || i == 21;
-        set_gate(i, err ? isr_fault_err : isr_fault_noerr, 0x8E);
+        set_gate(i, (void(*)(void))isr_fault_table[i], 0x8E);
     }
     set_gate(0x80, isr_syscall, 0xEE);          /* syscall gate, DPL 3 */
 
