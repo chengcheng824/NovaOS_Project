@@ -559,7 +559,7 @@ static void cmd_help(void)
 static void cmd_ver(void)
 {
     set_color(C_LCYAN); vga_puts("novaos"); reset_color();
-    kputs(" v0.2  (32bit)  ");
+    kputs(" v0.2.1  (32bit)  ");
     set_color(C_DGRAY); vga_puts(__DATE__); reset_color(); kput('\n');
 }
 
