@@ -108,8 +108,16 @@ _isr_syscall:
     iretd
 
 ; ---- exception gates: per-vector stubs, never return ----
-; Each stub pushes the vector number as a 2nd arg to fault_dispatch.
 ; Vectors that push a CPU error code: 8,10-14,17,21.  Others get a fake 0.
+;
+; Standard frame we build on the stack (growing DOWN, low = top):
+;   top of stack →  EDI ESI EBP ORIG_ESP EBX EDX ECX EAX  (pushad, 8*4 = 32B)
+;                   ERR_CODE                             (1*4)
+;                   EIP CS EFLAGS [USER_ESP USER_SS]     (CPU iret frame)
+;
+; CPU decides whether USER_ESP/USER_SS are present based on the CPL
+; transition.  We do NOT try to normalize that here — C code uses the
+; CS.RPL bits to tell which layout is in effect.
 %macro FAULT 2           ; %1 = vector number, %2 = has_error (1 or 0)
 _isr_fault_%1:
     push edx
@@ -123,8 +131,12 @@ _isr_fault_%1:
     push dword 0           ; synthesize a dummy error code
 %endif
     pushad
-    push esp               ; arg1: regs_t*
-    push dword %1           ; arg2: vector number
+    ; C calling convention (cdecl): rightmost param pushed FIRST.
+    ; Prototype:  fault_dispatch(regs_t *r, uint32_t vector)
+    ;               arg1 (left, pushed last)  arg2 (right, pushed first)
+    push dword %1          ; arg2 = vector number
+    lea  eax, [esp + 4]    ; &pushad = current ESP (after pushing vector) + 4
+    push eax               ; arg1 = regs_t* (explicit lea avoids push-esp pitfall)
     call _fault_dispatch
     add  esp, 8
 .hang_%1: jmp .hang_%1

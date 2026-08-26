@@ -13,6 +13,8 @@
 #define ATA_DRIVE    0x1F6
 #define ATA_CMD      0x1F7
 #define ATA_STATUS   0x1F7
+#define ATA_ALTSTAT  0x3F6     /* Alternate Status (read) / Device Ctrl (write) */
+#define ATA_DCR      0x3F6
 
 #define ATA_CMD_READ  0x20
 #define ATA_CMD_WRITE 0x30
@@ -21,33 +23,67 @@
 #define ATA_SR_DRQ   0x08
 #define ATA_SR_BSY   0x80
 
+#define ATA_DCR_SRST 0x04      /* Software Reset */
+#define ATA_DCR_nIEN 0x02      /* Disable IRQ (we poll, so always set) */
+
 static inline void outb(uint16_t p, uint8_t v){ __asm__ volatile ("outb %0,%1"::"a"(v),"Nd"(p)); }
 static inline void outw(uint16_t p, uint16_t v){ __asm__ volatile ("outw %0,%1"::"a"(v),"Nd"(p)); }
 static inline uint8_t  inb(uint16_t p){ uint8_t v; __asm__ volatile ("inb %1,%0":"=a"(v):"Nd"(p)); return v; }
 static inline uint16_t inw(uint16_t p){ uint16_t v; __asm__ volatile ("inw %1,%0":"=a"(v):"Nd"(p)); return v; }
 
+/* 400ns delay (ATA spec): two reads of Alternate Status */
+static inline void ata_delay400(void){
+    (void)inb(ATA_ALTSTAT);
+    (void)inb(ATA_ALTSTAT);
+}
+
 /* bounded waits: never hang the kernel on a wedged drive (~1s each) */
-#define ATA_TIMEOUT 1000000
+#define ATA_TIMEOUT 500000     /* each poll already has ata_delay400 inside */
 
 static int ata_wait_bsy(void){
     uint32_t t = ATA_TIMEOUT;
-    while(inb(ATA_STATUS) & ATA_SR_BSY){ if(--t == 0) return -1; }
-    return 0;
+    while(1) {
+        uint8_t s = inb(ATA_ALTSTAT);
+        if(!(s & ATA_SR_BSY)) return 0;
+        if(--t == 0) return -1;
+        ata_delay400();
+    }
 }
 
 static int ata_wait_drq(void){
-    uint8_t s;
     uint32_t t = ATA_TIMEOUT;
-    do {
-        s = inb(ATA_STATUS);
+    while(1) {
+        uint8_t s = inb(ATA_ALTSTAT);
+        if(s & (ATA_SR_DRQ | ATA_SR_ERR)) return (s & ATA_SR_ERR) ? -1 : 0;
         if(--t == 0) return -1;
-    } while(!(s & (ATA_SR_DRQ | ATA_SR_ERR)));
-    return (s & ATA_SR_ERR) ? -1 : 0;
+        ata_delay400();
+    }
+}
+
+/* ATA soft-reset + select Master drive.  Required after a warm boot in
+ * some emulators (QEMU PIIX) otherwise BSY stays stuck forever. */
+static void ata_soft_reset(void){
+    outb(ATA_DCR, ATA_DCR_nIEN | ATA_DCR_SRST);
+    ata_delay400();
+    outb(ATA_DCR, ATA_DCR_nIEN);            /* clear SRST to release reset */
+    ata_delay400();
+    (void)ata_wait_bsy();                   /* reset clears BSY within ~1ms */
+    outb(ATA_DRIVE, 0xE0);                  /* Master drive, LBA addressing */
+    ata_delay400();
+    (void)ata_wait_bsy();
+}
+
+static int g_ata_inited = 0;
+static inline void ata_ensure_ready(void){
+    if(g_ata_inited) return;
+    ata_soft_reset();
+    g_ata_inited = 1;
 }
 
 /* Read `n` sectors starting at LBA `lba` into buf. buf must be n*512 bytes. */
 int ata_read(uint32_t lba, uint8_t *buf, uint32_t n){
     if(n == 0) return 0;
+    ata_ensure_ready();
     if(ata_wait_bsy() < 0) return -1;
     outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
     outb(ATA_COUNT, (uint8_t)n);
@@ -55,6 +91,7 @@ int ata_read(uint32_t lba, uint8_t *buf, uint32_t n){
     outb(ATA_LBA_MID, (uint8_t)(lba >> 8));
     outb(ATA_LBA_HI, (uint8_t)(lba >> 16));
     outb(ATA_CMD, ATA_CMD_READ);
+    ata_delay400();
 
     for(uint32_t s = 0; s < n; s++){
         if(ata_wait_bsy() < 0) return -1;
@@ -68,6 +105,7 @@ int ata_read(uint32_t lba, uint8_t *buf, uint32_t n){
 /* Write `n` sectors from buf to LBA `lba`. */
 int ata_write(uint32_t lba, const uint8_t *buf, uint32_t n){
     if(n == 0) return 0;
+    ata_ensure_ready();
     if(ata_wait_bsy() < 0) return -1;
     outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
     outb(ATA_COUNT, (uint8_t)n);
@@ -75,6 +113,7 @@ int ata_write(uint32_t lba, const uint8_t *buf, uint32_t n){
     outb(ATA_LBA_MID, (uint8_t)(lba >> 8));
     outb(ATA_LBA_HI, (uint8_t)(lba >> 16));
     outb(ATA_CMD, ATA_CMD_WRITE);
+    ata_delay400();
 
     for(uint32_t s = 0; s < n; s++){
         if(ata_wait_bsy() < 0) return -1;
