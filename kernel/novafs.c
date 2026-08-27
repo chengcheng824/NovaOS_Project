@@ -15,7 +15,11 @@ static void nx_str_cpy(char *d,const char *s){ while((*d++=*s++)); }
 static void nx_memset(void *d,int v,int n){ unsigned char *p=d; while(n--) *p++=(unsigned char)v; }
 static void nx_memcpy(void *d,const void *s,int n){ unsigned char *dd=d; const unsigned char *ss=s; while(n--) *dd++=*ss++; }
 
-static super_t   sb;
+/* The superblock lives in a full 512-byte sector buffer: ATA PIO always
+ * transfers whole sectors, so reading into a bare 20-byte struct would
+ * splash 492 bytes of sector data over neighbouring .bss variables. */
+static uint8_t   sb_sec[FS_BLOCK_SIZE];
+#define sb (*(super_t *)sb_sec)
 static inode_t   inode_tab[FS_MAX_INODES];
 static uint8_t   bmap[FS_BMAP_SECS*512];
 static int       fs_ready = 0;

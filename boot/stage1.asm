@@ -10,7 +10,7 @@
 ; Disk LBA map:
 ;   LBA 0          MBR (this sector)
 ;   LBA 1-2        Stage2 (2 sectors, 1024 bytes -> 0000:8000)
-;   LBA 3-82       Kernel (80 sectors reserved, -> 0000:8400)
+;   LBA 3-128     Kernel (126 sectors reserved, -> 0000:8400)
 ; ============================================================
 
 [bits 16]
@@ -22,7 +22,14 @@ KERNEL_OFF   equ 0x8400
 STAGE2_LBA   equ 1
 STAGE2_SECS  equ 2
 KERNEL_LBA   equ 3
-KERNEL_SECS  equ 80
+KERNEL_SECS  equ 126            ; total budget (LBA 3..128)
+; INT 13h DAP buffers cannot cross a 64K boundary: 0000:8400 tops out at
+; 0xFFFF (62 sectors). Split the kernel load: low part -> 0000:8400,
+; high part -> 1000:0000 (linear 0x10000, contiguous for stage2's copy).
+KERNEL_LO_SECS equ 62           ; 0x8400 .. 0xFFFF
+KERNEL_HI_SECS equ 64           ; 0x10000 .. 0x17FFF
+KERNEL_HI_LBA  equ 65
+KERNEL_SECS  equ 126
 
 start:
     cli
@@ -55,8 +62,13 @@ start:
     int  0x13
     jc   disk_error
 
-    ; --- Load Kernel (72 sectors at LBA 3 -> 0000:8400) ---
-    mov  si, dap_kernel
+    ; --- Load Kernel (126 sectors at LBA 3, split across the 64K boundary) ---
+    mov  si, dap_kernel_lo
+    mov  dl, [drive_num]
+    mov  ah, 0x42
+    int  0x13
+    jc   disk_error
+    mov  si, dap_kernel_hi
     mov  dl, [drive_num]
     mov  ah, 0x42
     int  0x13
@@ -108,14 +120,23 @@ dap_stage2:
     dw 0x0000          ; buffer segment
     dq STAGE2_LBA      ; starting LBA (64-bit)
 
-; --- DAP for Kernel (72 sectors at LBA 3 -> 0000:8400) ---
-dap_kernel:
+; --- DAP for Kernel low part (62 sectors at LBA 3 -> 0000:8400) ---
+dap_kernel_lo:
     db 0x10            ; DAP size (16 bytes)
     db 0               ; reserved
-    dw KERNEL_SECS     ; sectors to read
+    dw KERNEL_LO_SECS  ; sectors to read
     dw KERNEL_OFF      ; buffer offset
     dw 0x0000          ; buffer segment
     dq KERNEL_LBA      ; starting LBA (64-bit)
+
+; --- DAP for Kernel high part (64 sectors at LBA 65 -> 1000:0000) ---
+dap_kernel_hi:
+    db 0x10            ; DAP size (16 bytes)
+    db 0               ; reserved
+    dw KERNEL_HI_SECS  ; sectors to read
+    dw 0x0000          ; buffer offset
+    dw 0x1000          ; buffer segment (linear 0x10000)
+    dq KERNEL_HI_LBA   ; starting LBA (64-bit)
 
 ; --- Pad code to 446 bytes ---
 times 446 - ($ - $$) db 0

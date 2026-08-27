@@ -2,11 +2,11 @@
  * NovaOS - NovaFS tiny filesystem on-disk layout
  * ============================================================
  * Disk layout (LBA, 512B sectors):
- *   0   - 82    reserved (MBR + Stage2 + Kernel)
- *   83          Superblock
- *   84  - 115   Inode table (32 sectors, 256 inodes x 64B)
- *   116 - 123   Data block bitmap (8 sectors, 4096 blocks)
- *   124 +       Data blocks (512B each)
+ *   0   - 128   reserved (MBR + Stage2 + Kernel, kernel budget 126 sectors)
+ *   129         Superblock
+ *   130 - 161   Inode table (32 sectors, 256 inodes x 64B)
+ *   162 - 169   Data block bitmap (8 sectors, 4096 blocks)
+ *   170 +       Data blocks (512B each)
  * ============================================================ */
 #ifndef NEXFS_H
 #define NEXFS_H
@@ -14,12 +14,12 @@
 #include "stdint.h"
 
 #define FS_MAGIC        0x4E584653u   /* "NXFS" — kept from the old name so existing disks still mount */
-#define FS_SUPER_LBA    83
-#define FS_INODE_LBA    84
+#define FS_SUPER_LBA    129
+#define FS_INODE_LBA    130
 #define FS_INODE_SECS   32
-#define FS_BMAP_LBA     116
+#define FS_BMAP_LBA     162
 #define FS_BMAP_SECS    8
-#define FS_DATA_LBA     124
+#define FS_DATA_LBA     170
 #define FS_BLOCK_SIZE   512
 #define FS_MAX_INODES   256            /* 32 sectors / 64B */
 #define FS_MAX_BLOCKS   (8 * 512 * 8)  /* 8 sectors bitmap = 32768 bits */

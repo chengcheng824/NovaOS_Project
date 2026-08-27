@@ -150,6 +150,14 @@ int gfx_active(void) { return gfx_on; }
 int gfx_cols(void)   { return con_cols; }
 int gfx_rows(void)   { return con_rows; }
 
+/* debug probe: are the console internals still sane? */
+uint32_t gfx_dbg_state(void)
+{
+    return ((uint32_t)gfx_on << 24) | ((uint32_t)(cur_y & 0xFFF) << 12) |
+           (uint32_t)(cur_x & 0xFFF);
+}
+const void *gfx_dbg_fb(void) { return (const void *)fb; }
+
 static inline void px(int x, int y, uint32_t c)
 {
     if (x >= 0 && x < SCR_W && y >= 0 && y < SCR_H) fb[y * SCR_W + x] = c;

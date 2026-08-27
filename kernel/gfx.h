@@ -20,6 +20,8 @@ int  gfx_active(void);
 int  gfx_fail_stage(void); /* 0 ok; 1 font, 2 pci, 3 vbe */
 uint16_t gfx_dbg_id(void);
 uint32_t gfx_dbg_bar(void);
+uint32_t gfx_dbg_state(void);   /* debug: on<<24 | cur_y<<12 | cur_x */
+const void *gfx_dbg_fb(void);   /* debug: LFB pointer */
 const uint8_t *gfx_dbg_font(int c);
 int  gfx_cols(void);
 int  gfx_rows(void);

@@ -7,12 +7,13 @@ function Step($e,$a,$l){Write-Host "==> $l"-ForegroundColor Cyan;&$e @a;if($LAST
 Step nasm @('-f','bin','-I',"$BOOT\","$BOOT\stage1.asm","-o","$BUILD\stage1.bin") 'Stage1'
 Step nasm @('-f','bin','-I',"$BOOT\","$BOOT\stage2.asm","-o","$BUILD\stage2.bin") 'Stage2'
 Step nasm @('-f','win32',"$KERNEL\entry.asm","-o","$BUILD\entry.o") 'entry'
-Step gcc @('-m32','-ffreestanding','-fno-pie','-fno-stack-protector','-fno-asynchronous-unwind-tables','-c','-I',$KERNEL,"$KERNEL\kernel.c","-o","$BUILD\kernel.o") 'kernel.c'
-Step gcc @('-m32','-ffreestanding','-fno-pie','-fno-stack-protector','-fno-asynchronous-unwind-tables','-c','-I',$KERNEL,"$KERNEL\ata.c","-o","$BUILD\ata.o") 'ata.c'
-Step gcc @('-m32','-ffreestanding','-fno-pie','-fno-stack-protector','-fno-asynchronous-unwind-tables','-c','-I',$KERNEL,"$KERNEL\novafs.c","-o","$BUILD\novafs.o") 'novafs.c'
-Step gcc @('-m32','-ffreestanding','-fno-pie','-fno-stack-protector','-fno-asynchronous-unwind-tables','-c','-I',$KERNEL,"$KERNEL\acpi.c","-o","$BUILD\acpi.o") 'acpi.c'
-Step gcc @('-m32','-ffreestanding','-fno-pie','-fno-stack-protector','-fno-asynchronous-unwind-tables','-c','-I',$KERNEL,"$KERNEL\gfx.c","-o","$BUILD\gfx.o") 'gfx.c'
-Step gcc @('-m32','-ffreestanding','-fno-pie','-fno-stack-protector','-fno-asynchronous-unwind-tables','-c','-I',$KERNEL,"$KERNEL\paging.c","-o","$BUILD\paging.o") 'paging.c'
+$cc = '-m32','-ffreestanding','-fno-pie','-fno-stack-protector','-fno-asynchronous-unwind-tables','-Os'
+Step gcc ($cc + @('-c','-I',$KERNEL,"$KERNEL\kernel.c","-o","$BUILD\kernel.o")) 'kernel.c'
+Step gcc ($cc + @('-c','-I',$KERNEL,"$KERNEL\ata.c","-o","$BUILD\ata.o")) 'ata.c'
+Step gcc ($cc + @('-c','-I',$KERNEL,"$KERNEL\novafs.c","-o","$BUILD\novafs.o")) 'novafs.c'
+Step gcc ($cc + @('-c','-I',$KERNEL,"$KERNEL\acpi.c","-o","$BUILD\acpi.o")) 'acpi.c'
+Step gcc ($cc + @('-c','-I',$KERNEL,"$KERNEL\gfx.c","-o","$BUILD\gfx.o")) 'gfx.c'
+Step gcc ($cc + @('-c','-I',$KERNEL,"$KERNEL\paging.c","-o","$BUILD\paging.o")) 'paging.c'
 Step ld @('-m','i386pe','-Ttext','0x100000','--file-alignment','16','--section-alignment','16','-o',"$BUILD\kernel.elf","$BUILD\entry.o","$BUILD\kernel.o","$BUILD\ata.o","$BUILD\novafs.o","$BUILD\acpi.o","$BUILD\gfx.o","$BUILD\paging.o") 'Link'
 Step objcopy @('-O','binary','-j','.text','-j','.rdata','-j','.data',"$BUILD\kernel.elf","$BUILD\kernel.bin") 'objcopy'
 $binsize=(Get-Item "$BUILD\kernel.bin").Length
@@ -20,7 +21,7 @@ Write-Host ("    kernel.bin = {0} bytes"-f $binsize)-ForegroundColor Gray
 # disk image: stage1(1 sector) + stage2(2 sectors) + kernel + NovaFS area.
 # NovaFS uses LBA 83+ (superblock/inodes/bitmap/data). Make the image 1 MiB.
 $kernelSecs=[Math]::Ceiling($binsize/512.0)
-if($kernelSecs -gt 80){ Write-Host "[ERR] kernel.bin ($binsize B) exceeds the 80-sector boot budget (LBA 3..82, NovaFS starts at LBA 83)"-ForegroundColor Red; exit 1 }
+if($kernelSecs -gt 126){ Write-Host "[ERR] kernel.bin ($binsize B) exceeds the 126-sector boot budget (LBA 3..128, NovaFS starts at LBA 129)"-ForegroundColor Red; exit 1 }
 $totalSecs=2048
 if(3+$kernelSecs+4 -gt $totalSecs){ $totalSecs = 3+$kernelSecs+4 }
 $d=New-Object byte[](512*$totalSecs)
@@ -33,10 +34,10 @@ if (Test-Path "$PSScriptRoot\programs") {
     $cc = @('-m32','-ffreestanding','-fno-pie','-fno-stack-protector','-fno-asynchronous-unwind-tables','-I',"$PSScriptRoot\programs")
     Step gcc ($cc + @('-c',"$PSScriptRoot\programs\nxp_entry.c",'-o',"$BUILD\nxp_entry.o")) 'nxp_entry.c'
 
-    $SB_OFF  = 83  * 512     # superblock
-    $INO_OFF = 84  * 512     # inode table (256 x 64B)
-    $BMP_OFF = 116 * 512     # block bitmap
-    $DAT_OFF = 124 * 512     # data blocks
+    $SB_OFF  = 129 * 512     # superblock
+    $INO_OFF = 130 * 512     # inode table (256 x 64B)
+    $BMP_OFF = 162 * 512     # block bitmap
+    $DAT_OFF = 170 * 512     # data blocks
     $nextInode = 1
     $nextBlock = 1
 
@@ -83,8 +84,8 @@ if (Test-Path "$PSScriptRoot\programs") {
         [BitConverter]::GetBytes([uint32]0x4E584653).CopyTo($d,$SB_OFF+0)    # magic
         [BitConverter]::GetBytes([uint32]32768).CopyTo($d,$SB_OFF+4)         # total_blocks
         [BitConverter]::GetBytes([uint32]256).CopyTo($d,$SB_OFF+8)           # total_inodes
-        [BitConverter]::GetBytes([uint32]124).CopyTo($d,$SB_OFF+12)          # first_data_lba
-        [BitConverter]::GetBytes([uint32]84).CopyTo($d,$SB_OFF+16)           # first_inode_lba
+        [BitConverter]::GetBytes([uint32]170).CopyTo($d,$SB_OFF+12)          # first_data_lba
+        [BitConverter]::GetBytes([uint32]130).CopyTo($d,$SB_OFF+16)          # first_inode_lba
         $r = $INO_OFF                                                          # root inode 0
         $d[$r+0] = 2                                                           # T_DIR
         $d[$r+4] = [byte][char]'/'                                             # name "/"

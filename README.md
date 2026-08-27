@@ -1,18 +1,18 @@
 # NovaOS
 
-一个简洁的 32 位 C 语言操作系统内核，带 **Ring3 用户态**（分页 + TSS + IDT + int 0x80 syscall）、交互式 shell `NovaSh`、**NovaFS**（256 inode / 多级目录 / 递归删除）、**运行时 ACPI/AML 解析关机**、**Bochs VBE 图形驱动（1024x768x32 真彩控制台）**、**Windows BSOD 风格红屏崩溃页** 与美化启动画面，可用 QEMU 直接启动测试。（建议使用 QEMU 6.2，支持最好）
+一个简洁的 32 位 C 语言操作系统内核，带 **多用户登录**（开机认证 + 密码哈希持久化）、**Ring3 用户态**（分页 + TSS + IDT + int 0x80 syscall）、交互式 shell `NovaSh`、**NovaFS**（256 inode / 多级目录 / 递归删除）、**运行时 ACPI/AML 解析关机**、**Bochs VBE 图形驱动（1024x768x32 真彩控制台）**、**Windows BSOD 风格红屏崩溃页** 与美化启动画面，可用 QEMU 直接启动测试。（建议使用 QEMU 6.2，支持最好）
 
 ## 目录结构
 
 ```
 NovaOS/
 ├── boot/
-│   ├── stage1.asm          # MBR 引导扇区 (512B, LBA 磁盘加载)
+│   ├── stage1.asm          # MBR 引导扇区 (512B, LBA 加载；内核分两段读避开 64K 边界)
 │   ├── stage2.asm          # Stage2: A20/GDT/进入保护模式/拷贝内核/跳转
 │   └── kernel_entry.inc    # 内核布局常量 (加载地址 0x100000)
 ├── kernel/
 │   ├── entry.asm           # 32位内核入口 stub (设栈/段, 调用 kmain)
-│   ├── kernel.c            # 内核主体: VGA/键盘/串口/RTC + NovaSh shell
+│   ├── kernel.c            # 内核主体: VGA/键盘/串口/RTC + 登录/多用户 + NovaSh shell
 │   ├── ata.c / ata.h       # 磁盘 PIO ATA 驱动 (LBA 读写 512B 扇区)
 │   ├── novafs.c / novafs.h   # NovaFS 文件系统: 多级目录 + 递归删除
 │   ├── acpi.c / acpi.h     # 最小 ACPI/AML 解析器 (RSDP→FADT→DSDT, 解析 \_S5 关机)
@@ -40,7 +40,7 @@ NovaOS/
 ```
 
 产物：
-- `build\kernel.bin` —— flat binary（≈ 15 KB）
+- `build\kernel.bin` —— flat binary（预算 126 扇区 ≈ 63 KB，`build.ps1` 超限会报错）
 - `disk.img` —— 可启动的 1 MiB 原始磁盘镜像
 
 磁盘布局（LBA，512 B / sector）：
@@ -49,11 +49,16 @@ NovaOS/
 |--------------|-------------------------|
 | 0            | Stage1 (MBR)            |
 | 1 – 2        | Stage2                  |
-| 3 – 82       | Kernel                  |
-| 83           | NovaFS superblock        |
-| 84 – 115     | Inode 表 (256 × 64 B)   |
-| 116 – 123    | Block 位图              |
-| 124+         | 数据块                  |
+| 3 – 128      | Kernel（预算 126 扇区） |
+| 129          | NovaFS superblock        |
+| 130 – 161    | Inode 表 (256 × 64 B)   |
+| 162 – 169    | Block 位图              |
+| 170+         | 数据块                  |
+
+> 内核加载缓冲在实模式 `0000:8400`，BIOS INT 13h 的缓冲不能跨 64K 边界，
+> 所以 stage1 把内核**分两段**读：前 62 扇区 → `0000:8400`（至 0xFFFF），
+> 后 64 扇区 → `1000:0000`（线性 0x10000，两段无缝相接），stage2 拷贝逻辑不变。
+> 改动磁盘布局时必须同步 `kernel/novafs.h` 的 `FS_*_LBA` 常量与 `build.ps1` 的注入偏移。
 
 首次启动时若 superblock magic 不符，NovaFS 会**自动初始化**，不用手打 `format`。
 
@@ -64,17 +69,44 @@ NovaOS/
 ```
 
 QEMU 启动后：
-1. Stage1 (0x7C00) INT 13h LBA 加载 Stage2 + 内核
+1. Stage1 (0x7C00) INT 13h LBA 分两段加载 Stage2 + 内核（避开 64K 边界）
 2. Stage2 开 A20 / 设 GDT / 切保护模式，把内核从 0x8400 拷贝到 0x00100000，`jmp 0x08:0x100000`
 3. `entry.asm` 设置 SS/DS/ES/FS/GS = 0x10，栈顶 0x00200000，调用 C 的 `kmain`
-4. 横幅 → NovaSh
+4. 横幅 → 启动自检（cpu/video/com1/novafs/acpi/input/ring3）→ **登录提示** → NovaSh
 
 提示：
 - 串口（COM1）输出被主机 `run.ps1` 接管，`shutdown` 通过内核内置的最小 ACPI/AML 解析器运行时定位 PM1_CNT 与 `\_S5`（不再硬编码 0x604），优雅关机；`reboot` 通过 8042 键盘控制器复位。
-- 屏幕 + 串口双路输出，日志落到 `build\serial.log`。
+- 屏幕 + 串口双路输出，日志落到项目根目录 `serial.log`（含登录提示与各阶段 `[gfxdbg]` 状态探针）。
 - 历史问题（已解决）：此前 `D:\qemu` 里混有早年手动拷入的旧版 GTK/glib/SDL2 DLL，QEMU 每次退出都在 ntdll 崩一次（c000000d，弹"已停止工作"）。用 Geek 强制卸载清空后重装官方 6.2.0 即根治，实测 9/9 次关机退出全部干净。若弹窗复现，先查事件查看器 Id=1000，与内核无关。
 
+## 登录与多用户
+
+开机自检完成后进入登录界面，认证通过才进 shell：
+
+```
+NovaOS login: root
+Password: ****          ← 输入回显为 *，支持退格
+Welcome, root. Type 'help' for commands.
+```
+
+- **默认账户**：`root` / 密码 `nova`（root 隐含存在；`/passwd` 里没有 root 行时用默认密码）
+- **账户库**：NovaFS 根目录的 `/passwd`，每行 `用户名:FFFFFFFF`（8 位十六进制 FNV-1a 哈希，**不存明文**）
+- 改动会立即经 ATA 写回磁盘，重启不丢；`format` 会清空账户（root/nova 仍可登录）
+- 用户名上限 23 字符（NovaFS 文件名限制）；密码上限 31 字符、不允许空密码
+- `logout` 回到登录界面可换账户登录；目前所有用户权限等价（无 root 专属命令限制）
+- 登录提示与输入同时回显到串口，方便无显示调试
+
 ## NovaSh 命令
+
+### 账户
+
+| 命令          | 说明                                        |
+|---------------|---------------------------------------------|
+| `whoami`      | 显示当前登录用户                            |
+| `passwd`      | 改当前用户密码（验旧密码 → 新密码输两遍）   |
+| `useradd 名`  | 创建新用户（提示设置密码）                  |
+| `userdel 名`  | 删除用户（root 不可删）                     |
+| `logout`      | 注销，返回登录界面                          |
 
 ### 通用
 
@@ -104,7 +136,7 @@ QEMU 启动后：
 | `rmdir 名`  | 删**空**目录                                 |
 | `rd 名`     | **强制删除整个目录树**（≈ `rm -rf / rd /s/q`）<br>保护：不能删 cwd 本身或其祖先，需先 `cd ..` |
 
-Shell prompt 显示当前工作目录：`novaos:/docs/sub#`
+Shell prompt 显示 当前用户 和当前工作目录：`root@novaos:/docs/sub#`
 
 ### 文件操作
 
@@ -204,6 +236,10 @@ Halted. Power off to restart.
 ## NovaFS 设计
 
 - **超级简单**，没有间接块、没有目录块：目录结构直接编码为 inode 的 `uint16_t parent` 字段
+- **超级块必须住满整个扇区**：ATA PIO 按扇区（512 B）整块传输，内核里的 `super_t` 只有 20 B，
+  若直接读进结构体会把 492 B 磁盘数据泼到相邻 .bss 变量上（曾把 gfx 控制台状态整个清零、
+  屏幕冻结在 com1 —— 已用 `sb_sec[512]` + 宏修复）。同理，所有 `ata_read/ata_write` 的
+  缓冲区都必须是 512 的整数倍
 - inode 共 256 个，64 B / 个：
 
 ```
@@ -220,6 +256,7 @@ typedef struct {
 
 - 数据块 512 B / 块，位图 8 sectors = 32768 bits，支持最多 32768 块
 - 每次 inode / bitmap 变动都通过 ATA PIO `ata_write()` 写回磁盘，**持久化**
+- 账户库 `/passwd` 就是根目录下的普通文件（多行 `用户名:哈希`），随 NovaFS 持久化
 
 ## 内存布局
 
@@ -254,34 +291,51 @@ typedef struct {
 ## 常见流程示例
 
 ```
-novaos:/# format
+NovaOS login: root
+Password: ****
+Welcome, root. Type 'help' for commands.
+
+root@novaos:/# useradd alice
+New password: ****
+Retype new password: ****
+User 'alice' created.
+
+root@novaos:/# format
 Formatting NovaFS... done. (root ready)
 
-novaos:/# mkdir docs
-novaos:/# mkdir docs/old          ← 不，不能带 "/"，要逐层 cd
-novaos:/# cd docs
-novaos:/docs# mkdir old
-novaos:/docs# write todo.txt
+root@novaos:/# mkdir docs
+root@novaos:/# mkdir docs/old          ← 不，不能带 "/"，要逐层 cd
+root@novaos:/# cd docs
+root@novaos:/docs# mkdir old
+root@novaos:/docs# write todo.txt
 Enter text. End with a single '.' on its own line:
 > buy milk
 > write os code
 > .
 Saved XX bytes.
 
-novaos:/docs# ls
+root@novaos:/docs# ls
   [DIR]  old
   [FILE] todo.txt  (XX B)
   2 item(s)
 
-novaos:/docs# cat todo.txt
+root@novaos:/docs# cat todo.txt
 buy milk
 write os code
 
-novaos:/docs# cd ..
-novaos:/# rmdir docs
+root@novaos:/docs# cd ..
+root@novaos:/# rmdir docs
 rmdir: directory not empty
-novaos:/# rd docs
+root@novaos:/# rd docs
 Directory removed.
+
+root@novaos:/# logout                  ← 换 alice 登录
+NovaOS login: alice
+Password: ****
+Welcome, alice. Type 'help' for commands.
+
+alice@novaos:/# whoami
+alice
 ```
 
 注意！在Win7上很有可能出现“已停止运行”，不影响！
