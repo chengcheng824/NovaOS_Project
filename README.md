@@ -19,8 +19,8 @@ NovaOS/
 │   ├── gfx.c / gfx.h       # Bochs VBE 图形驱动: 1024x768x32 真彩控制台 (128x48)
 │   ├── stdint.h            # 最小 stdint
 │   └── link.ld             # 链接脚本 (段紧凑于 0x100000)
-├── build.ps1  build.bat    # 构建脚本 (NASM + gcc + ld + objcopy -> disk.img)
-├── run.ps1    run.bat      # QEMU 启动脚本 (isa-debug-exit + 串口日志)
+├── build.ps1  build.bat    # 构建脚本 (NASM + gcc + ld + objcopy -> disk.img + data-seed.img)
+├── run.ps1    run.bat      # QEMU 启动脚本 (双盘: 引导盘 + 数据盘, isa-debug-exit + 串口日志)
 └── README.md
 ```
 
@@ -41,19 +41,29 @@ NovaOS/
 
 产物：
 - `build\kernel.bin` —— flat binary（预算 126 扇区 ≈ 63 KB，`build.ps1` 超限会报错）
-- `disk.img` —— 可启动的 1 MiB 原始磁盘镜像
+- `disk.img` —— 可启动的引导盘（只含 Stage1/2 + 内核）
+- `data-seed.img` —— NovaFS 数据盘模板（含内置 .nxp 程序）
 
-磁盘布局（LBA，512 B / sector）：
+**双盘架构**：用户数据（账户 `/passwd`、家目录、文件）放在独立的**数据盘** `data.img`
+（IDE 主通道从盘）上。`run.ps1` 第一次启动时从 `data-seed.img` 复制生成 `data.img`，
+之后**永不覆盖** —— 重新编译内核不会丢账户和文件；想彻底重置就删掉 `data.img` 再运行。
+
+引导盘 `disk.img` 布局（LBA，512 B / sector）：
 
 | LBA 范围     | 内容                    |
 |--------------|-------------------------|
 | 0            | Stage1 (MBR)            |
 | 1 – 2        | Stage2                  |
 | 3 – 128      | Kernel（预算 126 扇区） |
+
+数据盘 `data.img` 布局（LBA，512 B / sector）：
+
+| LBA 范围     | 内容                    |
+|--------------|-------------------------|
 | 129          | NovaFS superblock        |
 | 130 – 161    | Inode 表 (256 × 64 B)   |
 | 162 – 169    | Block 位图              |
-| 170+         | 数据块                  |
+| 170+         | 数据块（共 32768 块）   |
 
 > 内核加载缓冲在实模式 `0000:8400`，BIOS INT 13h 的缓冲不能跨 64K 边界，
 > 所以 stage1 把内核**分两段**读：前 62 扇区 → `0000:8400`（至 0xFFFF），
@@ -75,6 +85,7 @@ QEMU 启动后：
 4. 横幅 → 启动自检（cpu/video/com1/novafs/acpi/input/ring3）→ **登录提示** → NovaSh
 
 提示：
+- 用户数据在独立的 `data.img`（IDE 从盘）上：重新 build 不丢账户/文件；删掉 `data.img` 再运行即从模板重置（内置程序也会回来）
 - 串口（COM1）输出被主机 `run.ps1` 接管，`shutdown` 通过内核内置的最小 ACPI/AML 解析器运行时定位 PM1_CNT 与 `\_S5`（不再硬编码 0x604），优雅关机；`reboot` 通过 8042 键盘控制器复位。
 - 屏幕 + 串口双路输出，日志落到项目根目录 `serial.log`（含登录提示与各阶段 `[gfxdbg]` 状态探针）。
 - 历史问题（已解决）：此前 `D:\qemu` 里混有早年手动拷入的旧版 GTK/glib/SDL2 DLL，QEMU 每次退出都在 ntdll 崩一次（c000000d，弹"已停止工作"）。用 Geek 强制卸载清空后重装官方 6.2.0 即根治，实测 9/9 次关机退出全部干净。若弹窗复现，先查事件查看器 Id=1000，与内核无关。
@@ -91,9 +102,11 @@ Welcome, root. Type 'help' for commands.
 
 - **默认账户**：`root` / 密码 `nova`（root 隐含存在；`/passwd` 里没有 root 行时用默认密码）
 - **账户库**：NovaFS 根目录的 `/passwd`，每行 `用户名:FFFFFFFF`（8 位十六进制 FNV-1a 哈希，**不存明文**）
-- 改动会立即经 ATA 写回磁盘，重启不丢；`format` 会清空账户（root/nova 仍可登录）
+- **家目录**：`useradd` 自动建 `/home/<名字>`；非 root 用户登录（或 `su` 过去）后直接落在自己家里，root 落在 `/`
+- **特权分离**：仅 root 可 `useradd` / `userdel` / `format`；`su` 时 root 切换免密、普通用户要输目标密码
+- 改动会立即经 ATA 写回数据盘，重启、重新编译都不丢；`format`（仅 root）会清空账户（root/nova 仍可登录）
 - 用户名上限 23 字符（NovaFS 文件名限制）；密码上限 31 字符、不允许空密码
-- `logout` 回到登录界面可换账户登录；目前所有用户权限等价（无 root 专属命令限制）
+- `logout` 回到登录界面可换账户登录；文件级 rwx 权限位尚未实现
 - 登录提示与输入同时回显到串口，方便无显示调试
 
 ## NovaSh 命令
@@ -104,9 +117,13 @@ Welcome, root. Type 'help' for commands.
 |---------------|---------------------------------------------|
 | `whoami`      | 显示当前登录用户                            |
 | `passwd`      | 改当前用户密码（验旧密码 → 新密码输两遍）   |
-| `useradd 名`  | 创建新用户（提示设置密码）                  |
-| `userdel 名`  | 删除用户（root 不可删）                     |
+| `useradd 名`  | 创建用户并建家目录 `/home/名`（**仅 root**）|
+| `userdel 名`  | 删除用户及家目录（**仅 root**，root 不可删）|
+| `su 名`       | 切换用户：root 免密，其他用户需输目标密码；切换后落到对方家目录 |
 | `logout`      | 注销，返回登录界面                          |
+
+特权模型（无多任务下的简化版）：只有 **root** 能执行 `useradd` / `userdel` / `format`，
+其他用户执行会得到 `permission denied`；文件级权限位暂未实现，所有用户仍能读写全部文件。
 
 ### 通用
 
@@ -222,7 +239,9 @@ Halted. Power off to restart.
 把 C 源文件放进 `programs\`（如 `hello.c`），运行 `build.ps1` 即自动：
 
 1. 编译链接为 `.nxp`（`nxp_entry.c` 提供入口跳板，链接在最前；`nxp.h` 是 API 头）
-2. 直接写入 disk.img 的 NovaFS 区域（宿主机生成超级块/inode/位图/数据块）
+2. 直接写入数据盘模板 `data-seed.img` 的 NovaFS 区域（宿主机生成超级块/inode/位图/数据块）。
+   已存在的 `data.img` 不会被覆盖 —— 改了 `programs\` 里的源码想让 guest 用上新版，
+   删掉 `data.img` 让它重新播种即可（用户数据会一并重置，注意备份）
 3. 开机后 `NovaFS mounted`，直接 `run 文件名.nxp` 执行
 
 写法参考：

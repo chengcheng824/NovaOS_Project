@@ -60,20 +60,31 @@ static int ata_wait_drq(void){
     }
 }
 
-/* ATA soft-reset + select Master drive.  Required after a warm boot in
- * some emulators (QEMU PIIX) otherwise BSY stays stuck forever. */
+static int g_ata_inited = 0;
+
+/* NovaFS lives on the primary SLAVE drive (a separate data disk), so
+ * rebuilding the boot image never touches user accounts or files. */
+static int g_slave = 0;
+void ata_set_slave(int on)
+{
+    g_slave = on ? 1 : 0;
+    g_ata_inited = 0;              /* force re-select + re-reset on next access */
+}
+static inline uint8_t ata_dev(void){ return (uint8_t)(g_slave ? 0xF0 : 0xE0); }
+
+/* ATA soft-reset + select the current drive.  Required after a warm boot
+ * in some emulators (QEMU PIIX) otherwise BSY stays stuck forever. */
 static void ata_soft_reset(void){
     outb(ATA_DCR, ATA_DCR_nIEN | ATA_DCR_SRST);
     ata_delay400();
     outb(ATA_DCR, ATA_DCR_nIEN);            /* clear SRST to release reset */
     ata_delay400();
     (void)ata_wait_bsy();                   /* reset clears BSY within ~1ms */
-    outb(ATA_DRIVE, 0xE0);                  /* Master drive, LBA addressing */
+    outb(ATA_DRIVE, ata_dev());              /* selected drive, LBA addressing */
     ata_delay400();
     (void)ata_wait_bsy();
 }
 
-static int g_ata_inited = 0;
 static inline void ata_ensure_ready(void){
     if(g_ata_inited) return;
     ata_soft_reset();
@@ -85,7 +96,7 @@ int ata_read(uint32_t lba, uint8_t *buf, uint32_t n){
     if(n == 0) return 0;
     ata_ensure_ready();
     if(ata_wait_bsy() < 0) return -1;
-    outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
+    outb(ATA_DRIVE, ata_dev() | ((lba >> 24) & 0x0F));
     outb(ATA_COUNT, (uint8_t)n);
     outb(ATA_LBA_LO, (uint8_t)(lba));
     outb(ATA_LBA_MID, (uint8_t)(lba >> 8));
@@ -107,7 +118,7 @@ int ata_write(uint32_t lba, const uint8_t *buf, uint32_t n){
     if(n == 0) return 0;
     ata_ensure_ready();
     if(ata_wait_bsy() < 0) return -1;
-    outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
+    outb(ATA_DRIVE, ata_dev() | ((lba >> 24) & 0x0F));
     outb(ATA_COUNT, (uint8_t)n);
     outb(ATA_LBA_LO, (uint8_t)(lba));
     outb(ATA_LBA_MID, (uint8_t)(lba >> 8));

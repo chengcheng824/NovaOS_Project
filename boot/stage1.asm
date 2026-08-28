@@ -29,7 +29,6 @@ KERNEL_SECS  equ 126            ; total budget (LBA 3..128)
 KERNEL_LO_SECS equ 62           ; 0x8400 .. 0xFFFF
 KERNEL_HI_SECS equ 64           ; 0x10000 .. 0x17FFF
 KERNEL_HI_LBA  equ 65
-KERNEL_SECS  equ 126
 
 start:
     cli

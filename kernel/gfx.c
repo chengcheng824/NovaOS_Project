@@ -140,6 +140,7 @@ static const uint32_t pal[16] = {
 };
 
 static volatile uint32_t *fb;      /* LFB as 32bpp pixels */
+static uint32_t lfb_base;          /* raw PCI BAR of the LFB (paging maps it), 0 = none */
 static int con_cols, con_rows;
 static int cur_x, cur_y;
 static uint8_t fg_idx_cur = 7, bg_idx_cur = 0;
@@ -157,6 +158,7 @@ uint32_t gfx_dbg_state(void)
            (uint32_t)(cur_x & 0xFFF);
 }
 const void *gfx_dbg_fb(void) { return (const void *)fb; }
+uint32_t gfx_lfb(void) { return lfb_base; }
 
 static inline void px(int x, int y, uint32_t c)
 {
@@ -346,6 +348,7 @@ int gfx_init(void)
     if (vbe_set_mode(SCR_W, SCR_H, SCR_BPP) < 0) { fail_stage = 3; return 0; }
 
     fb = (volatile uint32_t *)lfb;
+    lfb_base = lfb;
     con_cols = SCR_W / GLYPH_W;     /* 128 */
     con_rows = SCR_H / GLYPH_H;     /* 48 */
     cur_x = cur_y = 0;

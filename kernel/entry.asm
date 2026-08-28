@@ -86,6 +86,7 @@ _ring3_leave:
     ; SS:ESP pair is updated atomically with respect to interrupts/NMIs.
     mov  ss, dx
     mov  esp, [k3_esp]
+    cld                              ; user code may have left DF set
     ret
 
 ; ---- int 0x80 syscall gate (DPL 3 trap gate) ----
@@ -100,6 +101,7 @@ _isr_syscall:
     mov  fs, dx
     mov  gs, dx
     pop  edx
+    cld                              ; user code may have left DF set
     pushad
     push esp
     call _syscall_dispatch
@@ -127,6 +129,7 @@ _isr_fault_%1:
     mov  fs, dx
     mov  gs, dx
     pop  edx
+    cld                              ; user code may have left DF set
 %if %2 == 0
     push dword 0           ; synthesize a dummy error code
 %endif

@@ -13,6 +13,7 @@
 extern void kput(char c);
 extern void kputs(const char *s);
 extern void kput_hex(unsigned v);
+extern void kput_dec(unsigned v);
 
 /* asm helpers from entry.asm */
 extern void isr_syscall(void);
@@ -55,10 +56,15 @@ enum { SYS_PUTC, SYS_PUTS, SYS_GETCHAR, SYS_EXIT,
 
 uint32_t g_nxp_exit_stub;
 
+/* runtime stub addresses, for fault diagnostics */
+static uint32_t g_stub_addr[SYS_COUNT];
+
 /* ---- accept only user-space pointers from user programs ---- */
 static uint32_t uptr(uint32_t p)
 {
-    return (p >= 0x00300000u && p < 0x00600000u) ? p : 0;
+    /* user-mapped RAM ends at 0x501000: ptl covers 3MB..4MB, ptu covers
+     * 4MB..5MB+4K (i <= 0x100). Pointers above that are supervisor-only. */
+    return (p >= 0x00300000u && p < 0x00501000u) ? p : 0;
 }
 
 void syscall_dispatch(regs_t *r)
@@ -185,6 +191,31 @@ void fault_dispatch(regs_t *r, uint32_t vector)   /* exception 0..31, never retu
         kputs("  eip=");  kput_hex(r->r[9]);
         kputs(" err=");   kput_hex(r->r[8]);
         kputs(" cr2=");   kput_hex(cr2);
+        kputs(" uesp=");  kput_hex(r->r[12]);   /* CPL3 frame carries user SS:ESP */
+        if (r->r[9] >= NXP_TRAMP_BASE && r->r[9] < NXP_TRAMP_BASE + 0x1000u) {
+            int s = SYS_COUNT - 1;              /* which stub region eip sits after */
+            while (s > 0 && g_stub_addr[s] > r->r[9]) s--;
+            kputs(" (tramp, after stub "); kput_dec((unsigned)s); kputs(")");
+        }
+        /* dump the first instruction bytes at the fault point — the whole
+         * user area is identity-mapped, so this read cannot fault */
+        if (r->r[9] >= 0x00300000u && r->r[9] < 0x00501000u) {
+            static const char hx[] = "0123456789ABCDEF";
+            const volatile uint8_t *ip = (const volatile uint8_t *)r->r[9];
+            kputs("\n  insn:");
+            for (int i = 0; i < 8; i++) {
+                kput(' ');
+                kput(hx[(ip[i] >> 4) & 0xF]);
+                kput(hx[ip[i] & 0xF]);
+            }
+        }
+        /* top of the user stack: the return addresses the program pushed.
+         * A smashed stack (bad `ret` target) is immediately visible here. */
+        if (r->r[12] >= 0x00300000u && r->r[12] < 0x00501000u) {
+            volatile uint32_t *us = (volatile uint32_t *)r->r[12];
+            kputs("\n  ustack:");
+            for (int i = 0; i < 6; i++) { kput(' '); kput_hex(us[i]); }
+        }
         kput('\n');
         ring3_leave();                          /* kill the program */
     }
@@ -195,19 +226,26 @@ void fault_dispatch(regs_t *r, uint32_t vector)   /* exception 0..31, never retu
     for (;;) __asm__ volatile ("hlt");
 }
 
-/* ---- trampoline page: cdecl stub -> int 0x80 -> kernel ---- */
-static void emit_stub(uint8_t *p, uint32_t sysno, int nargs)
+/* ---- trampoline page: cdecl stub -> int 0x80 -> kernel ----
+ * returns the address just past the stub, so the caller lays the next
+ * one down without ever duplicating the size math */
+static uint8_t *emit_stub(uint8_t *p, uint32_t sysno, int nargs)
 {
+    *p++ = 0x53;                                        /* push ebx (callee-saved in cdecl:
+                                                         * the stub must preserve it) */
     *p++ = 0xB8; *(uint32_t *)p = sysno; p += 4;        /* mov eax,sysno */
     for (int i = 0; i < nargs; i++) {
-        *p++ = 0x8B; *p++ = 0x54; *p++ = 0x24;          /* mov edx,[esp+d] */
-        *p++ = (uint8_t)(4 + i * 4);
+        *p++ = 0x8B; *p++ = 0x54; *p++ = 0x24;          /* mov edx,[esp+8+i*4] (+4 for
+                                                         * the pushed ebx) */
+        *p++ = (uint8_t)(8 + i * 4);
         *p++ = 0x89; *p++ = 0x15;                       /* mov [abs],edx  */
         *(uint32_t *)p = NXP_TRAMP_ARGS + i * 4; p += 4;
     }
     *p++ = 0xBB; *(uint32_t *)p = NXP_TRAMP_ARGS; p += 4; /* mov ebx,args */
     *p++ = 0xCD; *p++ = 0x80;                           /* int 0x80      */
+    *p++ = 0x5B;                                        /* pop ebx       */
     *p++ = 0xC3;                                        /* ret           */
+    return p;
 }
 
 void ring3_setup_tramp(void)
@@ -218,8 +256,8 @@ void ring3_setup_tramp(void)
 
     for (int s = 0; s < SYS_COUNT; s++) {
         stub[s] = (uint32_t)p;
-        emit_stub(p, (uint32_t)s, nargs[s]);
-        p += 13 + nargs[s] * 9;
+        g_stub_addr[s] = stub[s];
+        p = emit_stub(p, (uint32_t)s, nargs[s]);
     }
     g_nxp_exit_stub = stub[SYS_EXIT];
 
@@ -278,7 +316,13 @@ static void map_init(void)
     pde[1] = PT_USER_ADDR | 0x7;                /* present | RW | US */
     for (int i = 2; i < 4; i++)                 /* 8..16MB: 4MB pages */
         pde[i] = ((uint32_t)i << 22) | 0x83;    /* present|RW|PS (supervisor only) */
-    pde[0xFD000000u >> 22] = 0xFD000000u | 0x93; /* LFB: +PCD, supervisor only */
+    /* LFB: map the PCI BAR gfx actually probed (supervisor only, PCD).
+     * Two 4MB pages so an unaligned BAR still covers the 3MB console. */
+    uint32_t lfb = gfx_lfb() & ~0x3FFFFFu;
+    if (lfb && lfb < 0xFFC00000u) {
+        pde[lfb >> 22]       = lfb | 0x93;
+        pde[(lfb >> 22) + 1] = (lfb + 0x400000u) | 0x93;
+    }
 }
 
 void ring3_init(const void *api_table)

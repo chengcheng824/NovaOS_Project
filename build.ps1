@@ -18,10 +18,13 @@ Step ld @('-m','i386pe','-Ttext','0x100000','--file-alignment','16','--section-a
 Step objcopy @('-O','binary','-j','.text','-j','.rdata','-j','.data',"$BUILD\kernel.elf","$BUILD\kernel.bin") 'objcopy'
 $binsize=(Get-Item "$BUILD\kernel.bin").Length
 Write-Host ("    kernel.bin = {0} bytes"-f $binsize)-ForegroundColor Gray
-# disk image: stage1(1 sector) + stage2(2 sectors) + kernel + NovaFS area.
-# NovaFS uses LBA 83+ (superblock/inodes/bitmap/data). Make the image 1 MiB.
+
+# boot disk: stage1(1 sector) + stage2(2 sectors) + kernel (LBA 3..128).
+# User data (accounts, files) does NOT live here anymore - it lives on the
+# separate persistent data disk (data.img, primary IDE slave, created once
+# by run.ps1 from data-seed.img). Rebuilding never touches user data.
 $kernelSecs=[Math]::Ceiling($binsize/512.0)
-if($kernelSecs -gt 126){ Write-Host "[ERR] kernel.bin ($binsize B) exceeds the 126-sector boot budget (LBA 3..128, NovaFS starts at LBA 129)"-ForegroundColor Red; exit 1 }
+if($kernelSecs -gt 126){ Write-Host "[ERR] kernel.bin ($binsize B) exceeds the 126-sector boot budget (LBA 3..128)"-ForegroundColor Red; exit 1 }
 $totalSecs=2048
 if(3+$kernelSecs+4 -gt $totalSecs){ $totalSecs = 3+$kernelSecs+4 }
 $d=New-Object byte[](512*$totalSecs)
@@ -29,17 +32,22 @@ $d=New-Object byte[](512*$totalSecs)
 [Array]::Copy([IO.File]::ReadAllBytes("$BUILD\stage2.bin"),0,$d,512,(Get-Item "$BUILD\stage2.bin").Length)
 [Array]::Copy([IO.File]::ReadAllBytes("$BUILD\kernel.bin"),0,$d,512*3,$binsize)
 
-# ---- compile & inject .nxp programs (programs\*.c) into the NovaFS image ----
+# ---- NovaFS data-disk template (data-seed.img) ----
+# Sized for the FULL bitmap capacity (170 data-start + 32768 blocks), so
+# files can actually use all 32768 blocks the kernel's bitmap offers.
+$FS_SECS  = 170 + 32768
+$f = New-Object byte[](512*$FS_SECS)
+$SB_OFF  = 129 * 512     # superblock
+$INO_OFF = 130 * 512     # inode table (256 x 64B)
+$BMP_OFF = 162 * 512     # block bitmap
+$DAT_OFF = 170 * 512     # data blocks
+$nextInode = 1
+$nextBlock = 1
+
+# ---- compile & inject .nxp programs (programs\*.c) into the template ----
 if (Test-Path "$PSScriptRoot\programs") {
     $cc = @('-m32','-ffreestanding','-fno-pie','-fno-stack-protector','-fno-asynchronous-unwind-tables','-I',"$PSScriptRoot\programs")
     Step gcc ($cc + @('-c',"$PSScriptRoot\programs\nxp_entry.c",'-o',"$BUILD\nxp_entry.o")) 'nxp_entry.c'
-
-    $SB_OFF  = 129 * 512     # superblock
-    $INO_OFF = 130 * 512     # inode table (256 x 64B)
-    $BMP_OFF = 162 * 512     # block bitmap
-    $DAT_OFF = 170 * 512     # data blocks
-    $nextInode = 1
-    $nextBlock = 1
 
     foreach ($src in Get-ChildItem "$PSScriptRoot\programs\*.c" | Where-Object { $_.Name -ne 'nxp_entry.c' }) {
         $name = [IO.Path]::GetFileNameWithoutExtension($src.Name)
@@ -62,37 +70,37 @@ if (Test-Path "$PSScriptRoot\programs") {
 
         # inode entry: type=1(T_FILE) parent=0(root) name size blocks[]
         $ino = $INO_OFF + $nextInode * 64
-        $d[$ino+0] = 1
+        $f[$ino+0] = 1
         $fname = "$name.nxp"
         $nb = [Text.Encoding]::ASCII.GetBytes($fname)
         if ($nb.Length -gt 23) { Write-Host "[ERR] name too long: $fname"-ForegroundColor Red; exit 1 }
-        [Array]::Copy($nb,0,$d,$ino+4,$nb.Length)
-        [BitConverter]::GetBytes([uint32]$file.Length).CopyTo($d,$ino+28)
+        [Array]::Copy($nb,0,$f,$ino+4,$nb.Length)
+        [BitConverter]::GetBytes([uint32]$file.Length).CopyTo($f,$ino+28)
         $nblocks = [Math]::Ceiling($file.Length / 512.0)
         for ($b = 0; $b -lt $nblocks; $b++) {
             $blk = $nextBlock++
-            [BitConverter]::GetBytes([uint32]$blk).CopyTo($d,$ino+32+$b*4)
-            [Array]::Copy($file,$b*512,$d,$DAT_OFF+$blk*512,[Math]::Min(512,$file.Length-$b*512))
-            $d[$BMP_OFF + ($blk -shr 3)] = $d[$BMP_OFF + ($blk -shr 3)] -bor [byte](1 -shl ($blk -band 7))
+            [BitConverter]::GetBytes([uint32]$blk).CopyTo($f,$ino+32+$b*4)
+            [Array]::Copy($file,$b*512,$f,$DAT_OFF+$blk*512,[Math]::Min(512,$file.Length-$b*512))
+            $f[$BMP_OFF + ($blk -shr 3)] = $f[$BMP_OFF + ($blk -shr 3)] -bor [byte](1 -shl ($blk -band 7))
         }
         Write-Host ("    + $fname ({0} B)" -f $file.Length) -ForegroundColor Gray
         $nextInode++
     }
-
-    if ($nextInode -gt 1) {
-        # make the image a valid NovaFS disk: guest mounts instead of formatting
-        [BitConverter]::GetBytes([uint32]0x4E584653).CopyTo($d,$SB_OFF+0)    # magic
-        [BitConverter]::GetBytes([uint32]32768).CopyTo($d,$SB_OFF+4)         # total_blocks
-        [BitConverter]::GetBytes([uint32]256).CopyTo($d,$SB_OFF+8)           # total_inodes
-        [BitConverter]::GetBytes([uint32]170).CopyTo($d,$SB_OFF+12)          # first_data_lba
-        [BitConverter]::GetBytes([uint32]130).CopyTo($d,$SB_OFF+16)          # first_inode_lba
-        $r = $INO_OFF                                                          # root inode 0
-        $d[$r+0] = 2                                                           # T_DIR
-        $d[$r+4] = [byte][char]'/'                                             # name "/"
-        $d[$BMP_OFF] = $d[$BMP_OFF] -bor 1                                     # block 0 reserved
-    }
 }
 
+# make the template a valid NovaFS disk: guest mounts instead of formatting
+[BitConverter]::GetBytes([uint32]0x4E584653).CopyTo($f,$SB_OFF+0)    # magic
+[BitConverter]::GetBytes([uint32]32768).CopyTo($f,$SB_OFF+4)         # total_blocks
+[BitConverter]::GetBytes([uint32]256).CopyTo($f,$SB_OFF+8)           # total_inodes
+[BitConverter]::GetBytes([uint32]170).CopyTo($f,$SB_OFF+12)          # first_data_lba
+[BitConverter]::GetBytes([uint32]130).CopyTo($f,$SB_OFF+16)          # first_inode_lba
+$r = $INO_OFF                                                          # root inode 0
+$f[$r+0] = 2                                                           # T_DIR
+$f[$r+4] = [byte][char]'/'                                             # name "/"
+$f[$BMP_OFF] = $f[$BMP_OFF] -bor 1                                     # block 0 reserved
+
 [IO.File]::WriteAllBytes("$PSScriptRoot\disk.img",$d)
-Write-Host ("    disk.img = {0} bytes ({1} sectors)"-f (512*$totalSecs),$totalSecs)-ForegroundColor Gray
-Write-Host "[OK] disk.img built"-ForegroundColor Green
+[IO.File]::WriteAllBytes("$PSScriptRoot\data-seed.img",$f)
+Write-Host ("    disk.img      = {0} bytes ({1} sectors, boot only)"-f (512*$totalSecs),$totalSecs)-ForegroundColor Gray
+Write-Host ("    data-seed.img = {0} bytes (NovaFS template + programs)"-f (512*$FS_SECS))-ForegroundColor Gray
+Write-Host "[OK] built (user data in data.img is never touched by rebuilds)"-ForegroundColor Green

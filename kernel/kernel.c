@@ -250,6 +250,7 @@ static char kb_decode(uint8_t sc)
     }
     if (sc == 0x2A || sc == 0x36) { kb_shift = 1; return 0; }
     if (sc == 0x3A) { kb_caps = !kb_caps; return 0; }
+    if (sc == 0x01) return 27;              /* ESC (apps like paint quit on it) */
     if (sc >= 128) return 0;
     char c = kb_shift ? shift_map[sc] : scancode_map[sc];
     if (c >= 'a' && c <= 'z' && kb_caps && !kb_shift) c -= 32;
@@ -437,21 +438,6 @@ retry2:
     uint8_t y_raw   = y_raw1;
     uint8_t dow     = dow1;
 
-    kputs("REG00(sec)="); kput_hex(sec);
-    kputs("  REG02(min)="); kput_hex(min);
-    kputs("\n");
-
-    kputs("REG04(hour)="); kput_hex(hour);
-    kputs("  REG06(dow)="); kput_hex(dow);
-    kputs("\n");
-
-    kputs("REG07(day)="); kput_hex(day);
-    kputs("  REG08(mon)="); kput_hex(mon);
-    kputs("\n");
-
-    kputs("REG09(year)="); kput_hex(y_raw);
-    kputs("\n");
-
     /* reg B tells us the RTC data format: bit1 = 24h, bit2 = binary */
     uint8_t regb = cmos_read(0x0B);
     if(!(regb & 0x04)){                     /* BCD mode */
@@ -521,11 +507,13 @@ static char cwdbuf[128];
 /* login (defined further below) */
 static int g_logout = 0;
 static char g_cur_user[FS_NAME_LEN + 1] = "root";
+static int is_root(void);
 static void login_run(void);
 static void cmd_passwd(void);
 static void cmd_logout(void);
 static void cmd_useradd(const char *name);
 static void cmd_userdel(const char *name);
+static void cmd_su(const char *name);
 
 static void shell_prompt(void)
 {
@@ -565,7 +553,8 @@ static void cmd_help(void)
     set_color(C_LCYAN); vga_puts("  fsinfo  "); reset_color(); kputs("filesystem info\n");
     set_color(C_LCYAN); vga_puts("  passwd  "); reset_color(); kputs("change login password\n");
     set_color(C_LCYAN); vga_puts("  useradd "); reset_color(); kputs("create a new user\n");
-    set_color(C_LCYAN); vga_puts("  userdel "); reset_color(); kputs("delete a user\n");
+    set_color(C_LCYAN); vga_puts("  userdel "); reset_color(); kputs("delete a user (root)\n");
+    set_color(C_LCYAN); vga_puts("  su U    "); reset_color(); kputs("switch to another user\n");
     set_color(C_LCYAN); vga_puts("  whoami  "); reset_color(); kputs("show current user\n");
     set_color(C_LCYAN); vga_puts("  logout  "); reset_color(); kputs("return to login screen\n");
     set_color(C_LCYAN); vga_puts("  reboot  "); reset_color(); kputs("restart\n");
@@ -624,7 +613,9 @@ static void cmd_shutdown(void)
     kputs("[shutdown] start\n");
     serial_puts("SHUTDOWN_REQUEST\n");
 
-    if (g_acpi.fadt) {
+    /* only trust ACPI poweroff when there are actual PM1 control ports;
+     * otherwise fall through to the PIIX4 / QEMU debug-exit fallbacks */
+    if (g_acpi.fadt && (g_acpi.pm1a_cnt || g_acpi.pm1b_cnt)) {
         kputs("[shutdown] ACPI: PM1a="); kput_hex(g_acpi.pm1a_cnt);
         kputs(" PM1b="); kput_hex(g_acpi.pm1b_cnt);
         if (g_acpi.s5_found) {
@@ -640,7 +631,7 @@ static void cmd_shutdown(void)
     }
 
     /* no ACPI tables at all: QEMU-specific fallbacks */
-    kputs("[shutdown] ACPI tables missing, trying PIIX4 default (0x604)...\n");
+    kputs("[shutdown] ACPI poweroff unavailable, trying PIIX4 default (0x604)...\n");
     outw(0x604, 0x2000);
     kputs("[shutdown] trying QEMU debug-exit port 0x501...\n");
     outw(0x501, 0x0000);
@@ -705,7 +696,7 @@ typedef struct {
 } nxp_api_t;
 
 static void nxp_api_putc(char c)              { kput(c); }
-static void nxp_api_puts(const char *s)       { kputs(s); }
+static void nxp_api_puts(const char *s)       { if (s) kputs(s); }
 static int  nxp_api_getchar(void)             { return kb_read(); }
 static void nxp_api_exit(void)                { }   /* Ring3 exit goes through the syscall stub */
 static void nxp_api_pixel(uint32_t x, uint32_t y, uint32_t rgb) { gfx_pixel((int)x, (int)y, rgb); }
@@ -717,6 +708,7 @@ static void nxp_api_fill(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_
 }
 static void nxp_api_text(uint32_t x, uint32_t y, const char *s, uint32_t rgb)
 {
+    if (!s) return;
     if (gfx_active()) gfx_text((int)x, (int)y, s, rgb);
     else kputs(s);
 }
@@ -850,6 +842,7 @@ static void cmd_fsinfo(void)
 
 static void cmd_format(void)
 {
+    if (!is_root()) { kputs("format: permission denied (root only)\n"); return; }
     kputs("Formatting NovaFS... ");
     if(fs_format() < 0){ kputs("FAILED\n"); return; }
     kputs("done. (root ready)\n");
@@ -970,6 +963,7 @@ static void process_cmd(void) {
     else if (str_eq(cmd, "passwd"))cmd_passwd();
     else if (str_eq(cmd, "useradd"))cmd_useradd(args);
     else if (str_eq(cmd, "userdel"))cmd_userdel(args);
+    else if (str_eq(cmd, "su"))     cmd_su(args);
     else if (str_eq(cmd, "whoami")) { kputs(g_cur_user); kput('\n'); }
     else if (str_eq(cmd, "logout"))cmd_logout();
     else if (str_eq(cmd, "reboot"))cmd_reboot();
@@ -1014,11 +1008,16 @@ static void shell_run(void) {
 #define LOGIN_DEF_PASS "nova"
 #define PASS_MAX       32
 
+/* privilege model: root manages accounts + formats; everyone else may not.
+ * (No per-user file permissions yet — one step at a time.) */
+static int is_root(void) { return str_eq(g_cur_user, LOGIN_USER); }
+
 static void login_run(void);
 static void cmd_passwd(void);
 static void cmd_logout(void);
 static void cmd_useradd(const char *name);
 static void cmd_userdel(const char *name);
+static void cmd_su(const char *name);
 
 static uint32_t pass_hash(const char *s)
 {
@@ -1064,12 +1063,14 @@ static void hex8(char *dst, uint32_t h)
         dst[i] = hex[(h >> (28 - i * 4)) & 0xF];
 }
 
-/* read /passwd into textbuf, return byte count (0 = missing/empty) */
+/* read /passwd into textbuf, return byte count (0 = missing/empty,
+ * -1 = too big to handle — callers must not rewrite it) */
 static int passwd_load(void)
 {
     for (int i = 0; i < TXT_MAX; i++) textbuf[i] = 0;
     int sz = fs_size("passwd");
-    if (sz <= 0 || sz >= TXT_MAX) return 0;
+    if (sz <= 0) return 0;
+    if (sz >= TXT_MAX) return -1;
     fs_read("passwd", (uint8_t*)textbuf, TXT_MAX);
     return sz;
 }
@@ -1084,7 +1085,7 @@ static int login_find_hash(const char *user, uint32_t *out)
         fs_cd("/");
         int sz = passwd_load();
         fs_cd_path(cwdbuf);
-        for (int i = 0; i + 14 <= sz; ) {
+        for (int i = 0; i < sz; ) {
             int j = i;
             while (j < sz && textbuf[j] != '\n') j++;
             /* line [i,j): "name:HEX8" */
@@ -1093,11 +1094,13 @@ static int login_find_hash(const char *user, uint32_t *out)
                 while (m < len && textbuf[i + m] == user[m]) m++;
                 if (m == len) {
                     uint32_t v = 0;
+                    int bad = 0;
                     for (int k = 0; k < 8; k++) {
                         int d = hex_val(textbuf[i + len + 1 + k]);
-                        if (d < 0) { v = def; break; }
+                        if (d < 0) { bad = 1; break; }
                         v = (v << 4) | (uint32_t)d;
                     }
+                    if (bad) return 0;   /* corrupted line: never grant the default password */
                     *out = v;
                     return 1;
                 }
@@ -1117,9 +1120,10 @@ static int login_set_user(const char *user, uint32_t h)
     fs_getcwd(cwdbuf, sizeof(cwdbuf));
     fs_cd("/");
     int sz = passwd_load();
+    if (sz < 0) { fs_cd_path(cwdbuf); return -1; }   /* oversize: don't clobber it */
     static char fresh[TXT_MAX];
     int fn = 0, len = str_len(user);
-    for (int i = 0; i + 14 <= sz; ) {
+    for (int i = 0; i < sz; ) {
         int j = i;
         while (j < sz && textbuf[j] != '\n') j++;
         int skip = (j - i == len + 1 + 8 && textbuf[i + len] == ':');
@@ -1145,9 +1149,10 @@ static int login_del_user(const char *user)
     fs_getcwd(cwdbuf, sizeof(cwdbuf));
     fs_cd("/");
     int sz = passwd_load(), found = 0;
+    if (sz < 0) { fs_cd_path(cwdbuf); return -1; }   /* oversize: don't clobber it */
     static char fresh[TXT_MAX];
     int fn = 0, len = str_len(user);
-    for (int i = 0; i + 14 <= sz; ) {
+    for (int i = 0; i < sz; ) {
         int j = i;
         while (j < sz && textbuf[j] != '\n') j++;
         int hit = (j - i == len + 9 && textbuf[i + len] == ':');
@@ -1193,6 +1198,11 @@ static void login_run(void)
         if (login_find_hash(user, &h) && pass_hash(pass) == h) {
             for (int i = 0; i < (int)sizeof(g_cur_user); i++)
                 g_cur_user[i] = user[i];
+            /* land in the user's home directory (root stays at /) */
+            fs_cd("/");
+            if (!str_eq(user, LOGIN_USER) && fs_cd("home") == 0) {
+                if (fs_cd(user) < 0) fs_cd("/");
+            }
             kputs("\nWelcome, ");
             set_color(C_LGREEN); kputs(g_cur_user); reset_color();
             kputs(". Type 'help' for commands.\n");
@@ -1235,8 +1245,11 @@ static void cmd_passwd(void)
 static void cmd_useradd(const char *name)
 {
     if (!fs_is_ready()) { kputs("useradd: NovaFS not formatted\n"); return; }
+    if (!is_root()) { kputs("useradd: permission denied (root only)\n"); return; }
     if (!name || !*name) { kputs("usage: useradd <name>\n"); return; }
     if (str_len(name) >= FS_NAME_LEN) { kputs("useradd: name too long\n"); return; }
+    for (const char *p = name; *p; p++)
+        if (*p == ':' || *p == '/') { kputs("useradd: name may not contain ':' or '/'\n"); return; }
     uint32_t h;
     if (login_find_hash(name, &h)) { kputs("useradd: user already exists\n"); return; }
     char p1[PASS_MAX], p2[PASS_MAX];
@@ -1250,16 +1263,63 @@ static void cmd_useradd(const char *name)
         set_color(C_LRED); kputs("useradd: write failed\n"); reset_color();
         return;
     }
+    /* home directory /home/<name> (best effort) */
+    fs_getcwd(cwdbuf, sizeof(cwdbuf));
+    fs_cd("/");
+    if (fs_find("home") < 0) fs_mkdir("home");
+    if (fs_cd("home") == 0 && fs_find(name) < 0) fs_mkdir(name);
+    fs_cd_path(cwdbuf);
     kputs("User '"); kputs(name); kputs("' created.\n");
 }
 
 static void cmd_userdel(const char *name)
 {
     if (!fs_is_ready()) { kputs("userdel: NovaFS not formatted\n"); return; }
+    if (!is_root()) { kputs("userdel: permission denied (root only)\n"); return; }
     if (!name || !*name) { kputs("usage: userdel <name>\n"); return; }
     if (str_eq(name, LOGIN_USER)) { kputs("userdel: cannot delete root\n"); return; }
     if (login_del_user(name) < 0) { kputs("userdel: no such user\n"); return; }
+    /* drop the home directory too (best effort) */
+    fs_getcwd(cwdbuf, sizeof(cwdbuf));
+    fs_cd("/");
+    if (fs_cd("home") == 0 && fs_rmtree(name) == 0)
+        kputs("Home directory removed.\n");
+    fs_cd_path(cwdbuf);
     kputs("User '"); kputs(name); kputs("' deleted.\n");
+}
+
+/* su <name>: root switches to anyone without a password; anyone else must
+ * enter the target user's password. Single session — the old identity is
+ * simply replaced (there is no `exit` to go back; su again to return). */
+static void cmd_su(const char *name)
+{
+    char pass[PASS_MAX];
+    uint32_t h;
+    if (!fs_is_ready()) { kputs("su: NovaFS not formatted\n"); return; }
+    if (!name || !*name) { kputs("usage: su <user>\n"); return; }
+    if (str_len(name) >= FS_NAME_LEN) { kputs("su: no such user\n"); return; }
+    if (str_eq(name, g_cur_user)) { kputs("su: already this user\n"); return; }
+    if (!login_find_hash(name, &h)) { kputs("su: no such user\n"); return; }
+    if (!is_root()) {
+        set_color(C_LCYAN); vga_puts("Password: "); reset_color();
+        serial_puts("Password: ");
+        read_line(pass, sizeof(pass), 1);
+        serial_putc('\n');
+        if (pass_hash(pass) != h) {
+            set_color(C_LRED); kputs("su: wrong password\n"); reset_color();
+            return;
+        }
+    }
+    for (int i = 0; i < (int)sizeof(g_cur_user); i++)
+        g_cur_user[i] = name[i];
+    /* land in the new user's home directory (root stays at /) */
+    fs_cd("/");
+    if (!str_eq(name, LOGIN_USER) && fs_cd("home") == 0) {
+        if (fs_cd(name) < 0) fs_cd("/");
+    }
+    kputs("Now logged in as ");
+    set_color(C_LGREEN); kputs(g_cur_user); reset_color();
+    kput('\n');
 }
 
 /* ---- boot screen helpers ---- */

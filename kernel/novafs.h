@@ -1,11 +1,13 @@
 /* ============================================================
  * NovaOS - NovaFS tiny filesystem on-disk layout
  * ============================================================
- * Disk layout (LBA, 512B sectors):
- *   0   - 128   reserved (MBR + Stage2 + Kernel, kernel budget 126 sectors)
+ * Lives on the DATA disk (primary IDE slave, data.img) - separate from
+ * the boot disk - so rebuilding the boot image never wipes user data.
+ * Layout (LBA, 512B sectors):
+ *   0   - 128   reserved
  *   129         Superblock
  *   130 - 161   Inode table (32 sectors, 256 inodes x 64B)
- *   162 - 169   Data block bitmap (8 sectors, 4096 blocks)
+ *   162 - 169   Data block bitmap (8 sectors, 32768 blocks)
  *   170 +       Data blocks (512B each)
  * ============================================================ */
 #ifndef NEXFS_H

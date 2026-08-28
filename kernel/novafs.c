@@ -55,6 +55,7 @@ static void clear_inode(int idx){
 
 /* ---------- public API ---------- */
 int fs_init(void){
+    ata_set_slave(1);   /* NovaFS on the primary slave data disk, not the boot disk */
     if(ata_read(FS_SUPER_LBA, (uint8_t*)&sb, 1) < 0) return -1;
     /* Auto-format on first boot / old layout disk. User never wants to
      * manually re-format after a kernel rebuild, so just do it silently.
@@ -74,6 +75,7 @@ int fs_init(void){
 int fs_is_ready(void){ return fs_ready; }
 
 int fs_format(void){
+    ata_set_slave(1);   /* format the data disk, wherever we came from */
     nx_memset(&sb, 0, sizeof(sb));
     sb.magic = FS_MAGIC;
     sb.total_blocks  = FS_MAX_BLOCKS;
@@ -132,8 +134,20 @@ static void set_name(int idx, const char *name){
     /* last byte stays 0 (NUL terminator guaranteed) */
 }
 
+/* reject names that collide with shell path syntax or the /passwd line
+ * format ("." ".." would be unreachable, "/" "\\" break cd-path walking,
+ * ':' would corrupt the "name:HHHHHHHH" account records) */
+static int name_ok(const char *name){
+    if(!name[0]) return 0;
+    if(nx_str_eq(name,".") || nx_str_eq(name,"..")) return 0;
+    for(int i = 0; name[i]; i++)
+        if(name[i]=='/' || name[i]=='\\' || name[i]==':') return 0;
+    return 1;
+}
+
 int fs_create(const char *name){
     if(!fs_ready) return -1;
+    if(!name_ok(name)) return -1;
     if(fs_find(name) >= 0) return -1;
     if(nx_str_len(name) >= FS_NAME_LEN) return -1;
     int i = alloc_inode();   /* clears the whole inode */
@@ -150,6 +164,7 @@ int fs_create(const char *name){
 /* ---------- directory ops ---------- */
 int fs_mkdir(const char *name){
     if(!fs_ready) return -1;
+    if(!name_ok(name)) return -1;
     if(fs_find(name) >= 0) return -1;
     if(nx_str_len(name) >= FS_NAME_LEN) return -1;
     int i = alloc_inode();   /* clears the whole inode */
@@ -276,6 +291,7 @@ int fs_write(const char *name, const uint8_t *data, uint32_t len){
     if(need > NDIRECT) return -1;   /* check BEFORE creating, so an oversized
                                        write doesn't leave an empty file behind */
     int idx = fs_find(name);
+    if(idx >= 0 && inode_tab[idx].type == T_DIR) return -1;   /* never write into a directory */
     if(idx < 0) idx = fs_create(name);
     if(idx < 0) return -1;
     inode_t *in = &inode_tab[idx];

@@ -14,5 +14,17 @@ Write-Host "[Run] Booting NovaOS..." -ForegroundColor Cyan
 # exit code 0 via ACPI). The WER popup is suppressed via:
 #   HKCU\Software\Microsoft\Windows\Windows Error Reporting\Excluded Applications
 #   -> qemu-system-i386.exe = 1
-& $q -drive format=raw,file=disk.img -m 256 -rtc base=localtime,clock=host -device isa-debug-exit,iobase=0x501,iosize=2 -serial file:serial.log
+# Persistent user-data disk (accounts, /passwd, files) on the primary IDE
+# slave. Created ONCE from the build's template; build.ps1 never touches it
+# afterwards, so recompiling the kernel keeps all user data.
+if (-not (Test-Path "$PSScriptRoot\data.img")) {
+    if (Test-Path "$PSScriptRoot\data-seed.img") {
+        Copy-Item "$PSScriptRoot\data-seed.img" "$PSScriptRoot\data.img"
+        Write-Host "[Run] data.img created from template (fresh NovaFS)" -ForegroundColor Cyan
+    } else {
+        Write-Host "[ERR] data-seed.img not found - run build.ps1 first." -ForegroundColor Red
+        exit 1
+    }
+}
+& $q -drive format=raw,file=disk.img,if=ide,index=0,media=disk -drive format=raw,file=data.img,if=ide,index=1,media=disk -m 256 -rtc base=localtime,clock=host -device isa-debug-exit,iobase=0x501,iosize=2 -serial file:serial.log
 Write-Host "`n[QEMU exited] (code $LASTEXITCODE)" -ForegroundColor Green
