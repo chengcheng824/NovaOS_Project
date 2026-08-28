@@ -27,7 +27,29 @@ typedef struct {
      * of packets consumed (0 = no movement). */
     int  (*mouse)(int *dx, int *dy, int *btns);
     u32 (*get_pixel)(u32 x, u32 y);     /* read a pixel (software cursors) */
+    void (*cls)(void);                   /* clear screen + home cursor       */
+    void (*set_color)(u32 fg);           /* VGA attr foreground (see below)   */
+    int  (*getuser)(char *buf, u32 max); /* copy current login name into buf  */
+    int  (*getdate)(char *buf, u32 max); /* formatted RTC date line into buf  */
 } nxp_api_t;
+
+/* set_color() foreground values (VGA attribute low nibble) */
+#define NXP_COLOR_BLACK    0x00
+#define NXP_COLOR_BLUE     0x01
+#define NXP_COLOR_GREEN    0x02
+#define NXP_COLOR_CYAN     0x03
+#define NXP_COLOR_RED      0x04
+#define NXP_COLOR_MAGENTA  0x05
+#define NXP_COLOR_BROWN    0x06
+#define NXP_COLOR_LGRAY    0x07
+#define NXP_COLOR_DGRAY    0x08
+#define NXP_COLOR_LBLUE   0x09
+#define NXP_COLOR_LGREEN  0x0A
+#define NXP_COLOR_LCYAN   0x0B
+#define NXP_COLOR_LRED    0x0C
+#define NXP_COLOR_LMAGENTA 0x0D
+#define NXP_COLOR_YELLOW  0x0E
+#define NXP_COLOR_WHITE   0x0F
 
 #define NXP_BTN_L 1
 #define NXP_BTN_R 2

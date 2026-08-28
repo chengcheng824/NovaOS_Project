@@ -199,6 +199,10 @@ Ring3 规则：
                               与当前按键位；读后清零。按键：NXP_BTN_L/R/M = 1/2/4
 +0x34 get_pixel(x,y) ← 读一个像素。做 XOR 软件光标用（画两次自动还原，
                       任何背景上都可见且不留痕迹），paint.nxp 的十字光标即此实现
++0x38 cls()           ← 清屏 + 光标归位
++0x3C set_color(fg)   ← 设 VGA 属性前景色，取值见 nxp.h 的 NXP_COLOR_* (0x00–0x0F)
++0x40 getuser(buf,max) ← 把当前登录用户名拷进 buf，返回长度（Ring3 无需读 /passwd）
++0x44 getdate(buf,max) ← 把格式化 RTC 日期行 "Date: …  Time: …" 拷进 buf，返回长度
 ```
 
 方向键扩展码：`NXP_KEY_LEFT/RIGHT/UP/DOWN` = 0x11/0x12/0x13/0x14（nxp.h 有定义）。
@@ -249,6 +253,7 @@ Halted. Power off to restart.
 - `programs/ringok.c`  — **最小 Ring3 健全性测试**：打印 `[user] ring3 alive (ringok)` 然后 `exit(0x42)`；用它验证 Ring3 进入/返回正常
 - `programs/ringbad.c` — **用户态故障测试**：故意 `*(volatile uint32_t*)0x100000 = 1` 写只读内核页，期待触发 "user fault: #PF …" 然后安全回 shell（**不触发 BSOD**）
 - `programs/paint.c` — **交互式画板**：鼠标移动画笔，左键画、右键擦、方向键/WASD 移动、1-8 换色、c 清屏、q 退出（非阻塞 `getkey` + `mouse`）
+- `programs/nsh.c` — **Ring3 子集 shell**：把 NovaSh 的一部分命令抽出来跑在用户态，证明 shell 可脱离内核。从 NovaSh `run nsh.nxp` 进入，提示符 `用户@novaos:nsh#`，支持 `help`/`ver`/`about`/`echo`/`cls`/`whoami`/`date`/`mem`/`exit`；文件系统 / 用户管理 / `run` 仍留在内核 NovaSh，`exit` 回到内核 shell
 
 单程序上限 3 KB。注意 MinGW 链接 `.nxp` 必须加 `--image-base 0x00300000 --section-alignment 16`：前者防止 .data/.bss 被 ld 放到 0x400000+ 覆盖 syscall trampoline，后者避免 PE 4K 对齐把程序撑到十几 KB。
 

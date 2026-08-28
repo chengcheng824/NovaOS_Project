@@ -394,8 +394,32 @@ static uint8_t cmos_read(uint8_t reg)
     return inb(CMOS_DATA);
 }
 
-static void cmd_date(void)
+/* append helpers for building a date string into a buffer (shared by the
+ * kernel 'date' command and the SYS_GETDATE syscall) */
+static int buf_ch(char *buf, int n, int max, char c)
 {
+    if (n < max - 1) buf[n++] = c;
+    return n;
+}
+static int buf_str(char *buf, int n, int max, const char *s)
+{
+    while (*s && n < max - 1) buf[n++] = *s++;
+    return n;
+}
+static int buf_dec(char *buf, int n, int max, unsigned v)
+{
+    char tmp[12]; int k = 0;
+    if (v == 0) tmp[k++] = '0';
+    while (v) { tmp[k++] = (char)('0' + (v % 10)); v /= 10; }
+    while (k-- > 0 && n < max - 1) buf[n++] = tmp[k];
+    return n;
+}
+
+/* Format current RTC date/time as "Date: Day MM/DD/YYYY  Time: HH:MM:SS"
+ * (no trailing newline) into buf. Returns byte count, or 0 if too small. */
+static int format_date(char *buf, int max)
+{
+    if (max < 48) return 0;
     uint8_t sec1, min1, hour_raw1, day1, mon1, y_raw1, dow1;
     uint8_t sec2, min2, hour_raw2, day2, mon2, y_raw2, dow2;
 
@@ -456,44 +480,35 @@ retry2:
         if(!pm && hour == 12) hour = 0;                      /* 12 AM */
     }
 
-    uint16_t year;
-
-    if (y_raw < 80)
-        year = 2000 + y_raw;
-    else
-        year = 1900 + y_raw;
+    uint16_t year = (y_raw < 80) ? (uint16_t)(2000 + y_raw)
+                                 : (uint16_t)(1900 + y_raw);
 
     static const char *wday[] = {
         "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
     };
-
     const char *dn = (dow >= 1 && dow <= 7) ? wday[dow - 1] : "???";
 
-    kputs("Date: ");
-    kputs(dn);
-    kput(' ');
-    kput_dec(mon);
-    kput('/');
-    kput_dec(day);
-    kput('/');
-    kput_dec(year);
-    kputs("  Time: ");
+    int n = 0;
+    n = buf_str(buf, n, max, "Date: ");
+    n = buf_str(buf, n, max, dn);  n = buf_ch(buf, n, max, ' ');
+    n = buf_dec(buf, n, max, mon); n = buf_ch(buf, n, max, '/');
+    n = buf_dec(buf, n, max, day); n = buf_ch(buf, n, max, '/');
+    n = buf_dec(buf, n, max, year);
+    n = buf_str(buf, n, max, "  Time: ");
+    if (hour < 10) n = buf_ch(buf, n, max, '0');
+    n = buf_dec(buf, n, max, hour); n = buf_ch(buf, n, max, ':');
+    if (min  < 10) n = buf_ch(buf, n, max, '0');
+    n = buf_dec(buf, n, max, min);  n = buf_ch(buf, n, max, ':');
+    if (sec  < 10) n = buf_ch(buf, n, max, '0');
+    n = buf_dec(buf, n, max, sec);
+    buf[n] = 0;
+    return n;
+}
 
-    if (hour < 10)
-        kput('0');
-    kput_dec(hour);
-    kput(':');
-
-    if (min < 10)
-        kput('0');
-    kput_dec(min);
-    kput(':');
-
-    if (sec < 10)
-        kput('0');
-    kput_dec(sec);
-
-    kput('\n');
+static void cmd_date(void)
+{
+    char buf[64];
+    if (format_date(buf, sizeof buf) > 0) { kputs(buf); kput('\n'); }
 }
 
 /* ---- Shell ---- */
@@ -565,7 +580,7 @@ static void cmd_help(void)
 static void cmd_ver(void)
 {
     set_color(C_LCYAN); vga_puts("novaos"); reset_color();
-    kputs(" v0.2  (32bit)  ");
+    kputs(" v0.3  (32bit)  ");
     set_color(C_DGRAY); vga_puts(__DATE__); reset_color(); kput('\n');
 }
 
@@ -693,6 +708,10 @@ typedef struct {
     int  (*getkey)(void);           /* non-blocking: -1 = no key */
     int  (*mouse)(int *dx, int *dy, int *btns);  /* deltas since last call */
     uint32_t (*get_pixel)(uint32_t x, uint32_t y);   /* for XOR cursors */
+    void (*cls)(void);                              /* clear screen */
+    void (*set_color)(uint32_t fg);                 /* VGA attr foreground */
+    int  (*getuser)(char *buf, uint32_t max);      /* current login name */
+    int  (*getdate)(char *buf, uint32_t max);      /* formatted RTC date */
 } nxp_api_t;
 
 static void nxp_api_putc(char c)              { kput(c); }
@@ -727,6 +746,17 @@ static int nxp_api_mouse(int *dx, int *dy, int *btns)
     mouse_dx = mouse_dy = mouse_pkts = 0;
     return n;
 }
+static void nxp_api_cls(void)                  { vga_clear(); }
+static void nxp_api_setcolor(uint32_t fg)       { set_color((uint8_t)fg); }
+static int  nxp_api_getuser(char *buf, uint32_t max)
+{
+    if (!buf || max == 0) return 0;
+    uint32_t i = 0;
+    while (i + 1 < max && g_cur_user[i]) { buf[i] = g_cur_user[i]; i++; }
+    buf[i] = 0;
+    return (int)i;
+}
+static int nxp_api_getdate(char *buf, uint32_t max) { return format_date(buf, (int)max); }
 
 static nxp_api_t nxp_api = {
     0x3150584Eu, 1,
@@ -735,7 +765,8 @@ static nxp_api_t nxp_api = {
     nxp_api_pixel, nxp_api_fill, nxp_api_text,
     nxp_api_getkey,
     nxp_api_mouse,
-    nxp_api_getpixel
+    nxp_api_getpixel,
+    nxp_api_cls, nxp_api_setcolor, nxp_api_getuser, nxp_api_getdate
 };
 
 static void cmd_run(const char *name)

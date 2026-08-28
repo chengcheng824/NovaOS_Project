@@ -41,6 +41,7 @@ typedef struct {
     fn5 putc, puts, getchar, exit;
     uint32_t scr_w, scr_h;
     fn5 pixel, fill_rect, text, getkey, mouse, get_pixel;
+    fn5 cls, set_color, getuser, getdate;
 } kapi_t;
 static const kapi_t *g_api;
 
@@ -52,7 +53,9 @@ typedef struct { uint32_t r[12]; } regs_t;
 /* syscall numbers == trampoline stub order */
 enum { SYS_PUTC, SYS_PUTS, SYS_GETCHAR, SYS_EXIT,
        SYS_PIXEL, SYS_FILL, SYS_TEXT, SYS_GETKEY,
-       SYS_MOUSE, SYS_GETPIXEL, SYS_COUNT };
+       SYS_MOUSE, SYS_GETPIXEL,
+       SYS_CLS, SYS_SETCOLOR, SYS_GETUSER, SYS_GETDATE,
+       SYS_COUNT };
 
 uint32_t g_nxp_exit_stub;
 
@@ -87,6 +90,10 @@ void syscall_dispatch(regs_t *r)
         ret = g_api->mouse(uptr(a[0]), uptr(a[1]), uptr(a[2]), 0, 0);
         break;
     case SYS_GETPIXEL: ret = g_api->get_pixel(a[0], a[1], 0, 0, 0); break;
+    case SYS_CLS:      g_api->cls(0, 0, 0, 0, 0); break;
+    case SYS_SETCOLOR: g_api->set_color(a[0], 0, 0, 0, 0); break;
+    case SYS_GETUSER:  ret = g_api->getuser(uptr(a[0]), a[1], 0, 0, 0); break;
+    case SYS_GETDATE:  ret = g_api->getdate(uptr(a[0]), a[1], 0, 0, 0); break;
     }
     r->r[7] = ret;                              /* return value -> EAX */
 }
@@ -250,7 +257,7 @@ static uint8_t *emit_stub(uint8_t *p, uint32_t sysno, int nargs)
 
 void ring3_setup_tramp(void)
 {
-    static const uint8_t nargs[SYS_COUNT] = { 1,1,0,0,3,5,4,0,3,2 };
+    static const uint8_t nargs[SYS_COUNT] = { 1,1,0,0,3,5,4,0,3,2, 0,1,2,2 };
     uint8_t *p = (uint8_t *)NXP_TRAMP_BASE;
     uint32_t stub[SYS_COUNT];
 
@@ -269,6 +276,8 @@ void ring3_setup_tramp(void)
     t[8]  = stub[SYS_PIXEL];   t[9]  = stub[SYS_FILL];
     t[10] = stub[SYS_TEXT];    t[11] = stub[SYS_GETKEY];
     t[12] = stub[SYS_MOUSE];   t[13] = stub[SYS_GETPIXEL];
+    t[14] = stub[SYS_CLS];     t[15] = stub[SYS_SETCOLOR];
+    t[16] = stub[SYS_GETUSER]; t[17] = stub[SYS_GETDATE];
 }
 
 /* ---- descriptor helpers ---- */
