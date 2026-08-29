@@ -278,6 +278,8 @@ void gfx_putc(char c)
     } else if (c == '\b') {
         if (cur_x > 0) cur_x--;
         draw_cell(cur_x, cur_y);                /* erase glyph + refresh bg */
+    } else if (c == '\v') {                     /* cursor left, keep the glyph */
+        if (cur_x > 0) cur_x--;
     } else {
         put_cell_char(cur_x, cur_y, c);
         cur_x++;

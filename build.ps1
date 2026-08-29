@@ -46,7 +46,7 @@ $nextBlock = 1
 
 # ---- compile & inject .nxp programs (programs\*.c) into the template ----
 if (Test-Path "$PSScriptRoot\programs") {
-    $cc = @('-m32','-ffreestanding','-fno-pie','-fno-stack-protector','-fno-asynchronous-unwind-tables','-I',"$PSScriptRoot\programs")
+    $cc = @('-m32','-Os','-ffreestanding','-fno-pie','-fno-stack-protector','-fno-asynchronous-unwind-tables','-I',"$PSScriptRoot\programs")
     Step gcc ($cc + @('-c',"$PSScriptRoot\programs\nxp_entry.c",'-o',"$BUILD\nxp_entry.o")) 'nxp_entry.c'
 
     foreach ($src in Get-ChildItem "$PSScriptRoot\programs\*.c" | Where-Object { $_.Name -ne 'nxp_entry.c' }) {
@@ -55,35 +55,67 @@ if (Test-Path "$PSScriptRoot\programs") {
         # NOTE on i386pe: -Ttext only sets .text VMA; DEFAULT ImageBase is
         # 0x00400000 which leaves .data/.bss globals at 0x0040???? — way
         # outside our mapped NXP region (0x300000..). Kernel memcpy()s the
-        # flat binary to 0x300000 with a 4-byte 'NXP' header, so .text
-        # lands at 0x300004 exactly. Setting --image-base 0x300000 forces
-        # .bss/.rdata/.data VMA to live inside 0x300??? (ptl user pages).
-        Step ld   @('-m','i386pe','--image-base','0x300000','-Ttext','0x300004','--file-alignment','16','--section-alignment','16','-e','_nxp_entry','-o',"$BUILD\nxp_$name.elf","$BUILD\nxp_entry.o","$BUILD\nxp_$name.o") "nxp_$name.elf"
-        Step objcopy @('-O','binary',"$BUILD\nxp_$name.elf","$BUILD\nxp_$name.bin") "nxp_$name.bin"
+        # flat binary to its slot base with a 4-byte 'NXP' header, so
+        # .text lands at base+4 exactly. Setting --image-base per slot
+        # forces .bss/.rdata/.data VMA to live inside 0x300???-0x37FFFF
+        # (ptl user pages). Multiprocessing: one binary PER SLOT so no
+        # runtime relocation is ever needed.
+        for ($s = 0; $s -lt 4; $s++) {
+            $sbase = 0x300000 + $s * 0x20000
+            $ib = "0x{0:X}" -f $sbase            # --image-base
+            $tb = "0x{0:X}" -f ($sbase + 4)      # -Ttext (after the magic)
+            if ($s -eq 0) { $fname = "$name.nxp" } else { $fname = "$name.$s.nxp" }
+            Step ld   @('-m','i386pe','--image-base',$ib,'-Ttext',$tb,'--file-alignment','16','--section-alignment','16','-e','_nxp_entry','-o',"$BUILD\nxp_$name$s.elf","$BUILD\nxp_entry.o","$BUILD\nxp_$name.o") "nxp_$name$s.elf"
+            Step objcopy @('-O','binary','-j','.text','-j','.rdata','-j','.data',"$BUILD\nxp_$name$s.elf","$BUILD\nxp_$name$s.bin") "nxp_$name$s.bin"
 
-        $code = [IO.File]::ReadAllBytes("$BUILD\nxp_$name.bin")
-        $file = New-Object byte[] (4 + $code.Length)
-        $file[0]=0x4E; $file[1]=0x58; $file[2]=0x50; $file[3]=0x01
-        [Array]::Copy($code,0,$file,4,$code.Length)
-        if ($file.Length -gt 6*512) { Write-Host "[ERR] $name.nxp exceeds the 3072 B file limit"-ForegroundColor Red; exit 1 }
-        if ($nextInode -ge 256) { Write-Host "[ERR] too many programs"-ForegroundColor Red; exit 1 }
+            $code = [IO.File]::ReadAllBytes("$BUILD\nxp_$name$s.bin")
+            $file = New-Object byte[] (4 + $code.Length)
+            $file[0]=0x4E; $file[1]=0x58; $file[2]=0x50; $file[3]=0x01
+            [Array]::Copy($code,0,$file,4,$code.Length)
+            if ($file.Length -gt 6*512) { Write-Host "[ERR] $fname = $($file.Length) B exceeds the 3072 B file limit"-ForegroundColor Red; exit 1 }
+            if ($nextInode -ge 256) { Write-Host "[ERR] too many programs"-ForegroundColor Red; exit 1 }
 
-        # inode entry: type=1(T_FILE) parent=0(root) name size blocks[]
+            # inode entry: type=1(T_FILE) parent=0(root) name size blocks[]
+            $ino = $INO_OFF + $nextInode * 64
+            $f[$ino+0] = 1
+            $nb = [Text.Encoding]::ASCII.GetBytes($fname)
+            if ($nb.Length -gt 23) { Write-Host "[ERR] name too long: $fname"-ForegroundColor Red; exit 1 }
+            [Array]::Copy($nb,0,$f,$ino+4,$nb.Length)
+            [BitConverter]::GetBytes([uint32]$file.Length).CopyTo($f,$ino+28)
+            $nblocks = [Math]::Ceiling($file.Length / 512.0)
+            for ($b = 0; $b -lt $nblocks; $b++) {
+                $blk = $nextBlock++
+                [BitConverter]::GetBytes([uint32]$blk).CopyTo($f,$ino+32+$b*4)
+                [Array]::Copy($file,$b*512,$f,$DAT_OFF+$blk*512,[Math]::Min(512,$file.Length-$b*512))
+                $f[$BMP_OFF + ($blk -shr 3)] = $f[$BMP_OFF + ($blk -shr 3)] -bor [byte](1 -shl ($blk -band 7))
+            }
+            Write-Host ("    + $fname ({0} B)" -f $file.Length) -ForegroundColor Gray
+            $nextInode++
+        }
+    }
+}
+
+# ---- inject .nsh script examples (scripts\*.nsh) as plain text files ----
+if (Test-Path "$PSScriptRoot\scripts") {
+    foreach ($src in Get-ChildItem "$PSScriptRoot\scripts\*.nsh") {
+        $fname = $src.Name
+        $data = [IO.File]::ReadAllBytes($src.FullName)
+        if ($data.Length -gt 6*512) { Write-Host "[ERR] $fname exceeds the 3072 B file limit"-ForegroundColor Red; exit 1 }
+        if ($nextInode -ge 256) { Write-Host "[ERR] too many files"-ForegroundColor Red; exit 1 }
         $ino = $INO_OFF + $nextInode * 64
         $f[$ino+0] = 1
-        $fname = "$name.nxp"
         $nb = [Text.Encoding]::ASCII.GetBytes($fname)
         if ($nb.Length -gt 23) { Write-Host "[ERR] name too long: $fname"-ForegroundColor Red; exit 1 }
         [Array]::Copy($nb,0,$f,$ino+4,$nb.Length)
-        [BitConverter]::GetBytes([uint32]$file.Length).CopyTo($f,$ino+28)
-        $nblocks = [Math]::Ceiling($file.Length / 512.0)
+        [BitConverter]::GetBytes([uint32]$data.Length).CopyTo($f,$ino+28)
+        $nblocks = [Math]::Ceiling($data.Length / 512.0)
         for ($b = 0; $b -lt $nblocks; $b++) {
             $blk = $nextBlock++
             [BitConverter]::GetBytes([uint32]$blk).CopyTo($f,$ino+32+$b*4)
-            [Array]::Copy($file,$b*512,$f,$DAT_OFF+$blk*512,[Math]::Min(512,$file.Length-$b*512))
+            [Array]::Copy($data,$b*512,$f,$DAT_OFF+$blk*512,[Math]::Min(512,$data.Length-$b*512))
             $f[$BMP_OFF + ($blk -shr 3)] = $f[$BMP_OFF + ($blk -shr 3)] -bor [byte](1 -shl ($blk -band 7))
         }
-        Write-Host ("    + $fname ({0} B)" -f $file.Length) -ForegroundColor Gray
+        Write-Host ("    + $fname ({0} B)" -f $data.Length) -ForegroundColor Gray
         $nextInode++
     }
 }

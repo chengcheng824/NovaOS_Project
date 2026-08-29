@@ -18,6 +18,6 @@ void nxp_main(void)
     }
 
     API->puts("press any key to exit...\n");
-    API->getchar();
+    while (API->getchar() < 0) { }      /* getchar is non-blocking now */
     API->exit();
 }

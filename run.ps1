@@ -26,5 +26,7 @@ if (-not (Test-Path "$PSScriptRoot\data.img")) {
         exit 1
     }
 }
+# fresh serial log every boot (QEMU appends; old runs can hold raw bytes)
+if (Test-Path "$PSScriptRoot\serial.log") { Remove-Item "$PSScriptRoot\serial.log" -Force }
 & $q -drive format=raw,file=disk.img,if=ide,index=0,media=disk -drive format=raw,file=data.img,if=ide,index=1,media=disk -m 256 -rtc base=localtime,clock=host -device isa-debug-exit,iobase=0x501,iosize=2 -serial file:serial.log
 Write-Host "`n[QEMU exited] (code $LASTEXITCODE)" -ForegroundColor Green

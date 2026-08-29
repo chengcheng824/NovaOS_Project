@@ -31,6 +31,14 @@ typedef struct {
     void (*set_color)(u32 fg);           /* VGA attr foreground (see below)   */
     int  (*getuser)(char *buf, u32 max); /* copy current login name into buf  */
     int  (*getdate)(char *buf, u32 max); /* formatted RTC date line into buf  */
+    int  (*readfile)(const char *name, unsigned char *buf, u32 max);
+                                         /* read a NovaFS file (current dir),
+                                          * returns size, -1 = error          */
+    int  (*spawn)(const char *name);     /* run an .nxp as a new process;
+                                          * name.1/2/3.nxp picks the slot,
+                                          * returns pid (1..4), -1 = error    */
+    int  (*procs)(char *buf, u32 max);   /* "pid name\n" lines of the live
+                                          * processes into buf, returns count */
 } nxp_api_t;
 
 /* set_color() foreground values (VGA attribute low nibble) */

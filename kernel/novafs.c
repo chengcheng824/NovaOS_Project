@@ -384,3 +384,17 @@ int fs_list_dir(int dir, void (*cb)(const char*,int,uint32_t)){
     }
     return n;
 }
+
+/* ---------- disk usage (fsinfo) ---------- */
+int fs_space(uint32_t *used_blocks, uint32_t *used_inodes, uint32_t *used_bytes){
+    if(!fs_ready) return -1;
+    uint32_t ub = 0, ui = 0, uby = 0;
+    for(int i = 0; i < FS_MAX_BLOCKS; i++)
+        if(bmap[i>>3] & (1<<(i&7))) ub++;
+    for(int i = 0; i < FS_MAX_INODES; i++)
+        if(inode_tab[i].type != T_FREE){ ui++; uby += inode_tab[i].size; }
+    if(used_blocks) *used_blocks = ub;
+    if(used_inodes) *used_inodes = ui;
+    if(used_bytes)  *used_bytes  = uby;
+    return 0;
+}

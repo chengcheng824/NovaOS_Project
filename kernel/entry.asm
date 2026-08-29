@@ -7,12 +7,16 @@
 [extern _kmain]
 [extern _syscall_dispatch]
 [extern _fault_dispatch]
+[extern _irq0_dispatch]
 [global __start]
 [global _start]
 [global _ring3_enter]
 [global _ring3_leave]
 [global _isr_syscall]
 [global _isr_fault_table]
+[global _isr_irq0]
+[global _jmp_user]
+[global _main_checkpoint]
 
 section .text start=0x100000
 _start:
@@ -87,7 +91,8 @@ _ring3_leave:
     mov  ss, dx
     mov  esp, [k3_esp]
     cld                              ; user code may have left DF set
-    ret
+    sti                              ; every caller arrives via an interrupt
+    ret                              ; gate (IF=0) - the shell needs IF=1
 
 ; ---- int 0x80 syscall gate (DPL 3 trap gate) ----
 _isr_syscall:
@@ -108,6 +113,60 @@ _isr_syscall:
     add  esp, 4
     popad
     iretd
+
+; ---- IRQ0 preemption gate (IDT 0x20, ring0 only) ----
+; Frame when a user task was interrupted (top of stack, growing down):
+;   EDI ESI EBP ORIG_ESP EBX EDX ECX EAX   (pushad)
+;   EIP CS EFLAGS USER_ESP USER_SS         (CPU, PL3->PL0)
+; irq0_dispatch may overwrite all 13 dwords in place to switch tasks.
+_isr_irq0:
+    cld
+    pushad
+    push esp
+    call _irq0_dispatch
+    add  esp, 4
+    popad
+    iretd
+
+; ---- jmp_user(fr): iret straight into a saved 13-dword user frame ----
+; Used to (re-)enter a process without any kernel stack switching.
+_jmp_user:
+    mov  ecx, [esp+4]                ; cdecl arg: frame pointer
+    push eax
+    push edx
+    mov  ax, 0x23                    ; user data selectors for DS/ES/FS/GS
+    mov  ds, ax
+    mov  es, ax
+    mov  fs, ax
+    mov  gs, ax
+    pop  edx
+    pop  eax
+    push dword [ecx+48]              ; user ss
+    push dword [ecx+44]              ; user esp
+    push dword [ecx+40]              ; eflags
+    push dword [ecx+36]              ; user cs
+    push dword [ecx+32]              ; user eip
+    push dword [ecx+28]              ; eax
+    push dword [ecx+24]              ; ecx
+    push dword [ecx+20]              ; edx
+    push dword [ecx+16]              ; ebx
+    push dword [ecx+12]              ; orig esp (popped into nothing)
+    push dword [ecx+8]               ; ebp
+    push dword [ecx+4]               ; esi
+    push dword [ecx+0]               ; edi
+    popad
+    iretd
+
+; ---- main_checkpoint: park the caller's kernel context in k3_* ----
+; The scheduler's ring3_leave() resumes exactly here when the last
+; process exits. Call at a point where resuming is safe (shell loop).
+_main_checkpoint:
+    mov  [k3_ebx], ebx
+    mov  [k3_esi], esi
+    mov  [k3_edi], edi
+    mov  [k3_ebp], ebp
+    mov  [k3_esp], esp
+    ret
 
 ; ---- exception gates: per-vector stubs, never return ----
 ; Vectors that push a CPU error code: 8,10-14,17,21.  Others get a fake 0.

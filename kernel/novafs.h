@@ -67,6 +67,7 @@ int fs_size(const char *name);
 int fs_remove(const char *name);
 int fs_list(void (*cb)(const char *name, int type, uint32_t size));
 int fs_list_dir(int dir, void (*cb)(const char*,int,uint32_t));
+int fs_space(uint32_t *used_blocks, uint32_t *used_inodes, uint32_t *used_bytes);
 
 /* directory ops */
 int fs_mkdir(const char *name);

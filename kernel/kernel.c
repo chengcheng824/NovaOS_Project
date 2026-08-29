@@ -93,6 +93,8 @@ static inline void vga_putc(char c)
             vga_col--;
             VGA_MEM[vga_row * VGA_COLS + vga_col] = ((uint16_t)a << 8) | ' ';
         }
+    } else if (c == '\v') {             /* cursor left WITHOUT erase (line edit) */
+        if (vga_col > 0) vga_col--;
     } else {
         VGA_MEM[vga_row * VGA_COLS + vga_col] = ((uint16_t)a << 8) | (uint8_t)c;
         vga_col++;
@@ -320,6 +322,7 @@ static int kbuf_pop(void)
 }
 
 /* move all pending controller bytes into mouse/kbd buffers */
+static char hx2(unsigned v);            /* DIAG hex digit (defined below) */
 static void ps2_drain(void)
 {
     for (int guard = 0; guard < 64; guard++) {
@@ -327,8 +330,38 @@ static void ps2_drain(void)
         if (!(st & 1)) break;
         uint8_t b = inb(KB_DATA);
         if (st & AUX_TAG) mouse_feed(b);
-        else              kbuf_push(b);
+        else {
+            kbuf_push(b);
+            serial_putc('[');           /* DIAG: raw scancode stream */
+            serial_putc(hx2(b >> 4));
+            serial_putc(hx2(b));
+            serial_putc(']');
+        }
     }
+}
+
+/* DIAG: one hex digit to serial */
+static char hx2(unsigned v)
+{
+    static const char hx[] = "0123456789ABCDEF";
+    return hx[v & 0xF];
+}
+
+/* hotkey seen by kb_poll, consumed by the syscall dispatcher */
+static int g_hotkey;            /* 0x57=F11 / 0x58=F12 seen while polling */
+int kb_take_hotkey(void) { int h = g_hotkey; g_hotkey = 0; return h; }
+
+/* scheduler hotkeys (paging.c irq0): consume raw make-scancode `raw`
+ * from the PS/2 ring if it is pending (F11 = 0x57, F12 = 0x58) */
+int kb_take_raw(uint8_t raw)
+{
+    ps2_drain();
+    int i = khead;
+    while (i != ktail) {
+        if (kbuf[i] == raw) { kbuf[i] = 0; return 1; }
+        i = (i + 1) % KBUF;
+    }
+    return 0;
 }
 
 static int mouse_wait(int want_out)
@@ -373,6 +406,7 @@ static int kb_poll(void)
         ps2_drain();
         int v = kbuf_pop();
         if (v < 0) return -1;
+        if (v == 0x57 || v == 0x58) { g_hotkey = v; continue; }  /* scheduler hotkeys */
         char c = kb_decode((uint8_t)v);
         if (c) return c;
     }
@@ -562,7 +596,10 @@ static void cmd_help(void)
     set_color(C_LCYAN); vga_puts("  cat F   "); reset_color(); kputs("show file\n");
     set_color(C_LCYAN); vga_puts("  write F "); reset_color(); kputs("create file (end with .)\n");
     set_color(C_LCYAN); vga_puts("  rm F    "); reset_color(); kputs("delete file\n");
-    set_color(C_LCYAN); vga_puts("  run F   "); reset_color(); kputs("execute a .nxp program\n");
+    set_color(C_LCYAN); vga_puts("  run F   "); reset_color(); kputs("start a .nxp process (F.1/2/3 = slot)\n");
+    set_color(C_LCYAN); vga_puts("  procs   "); reset_color(); kputs("list running processes\n");
+    set_color(C_LCYAN); vga_puts("  fg      "); reset_color(); kputs("resume suspended processes\n");
+    set_color(C_LCYAN); vga_puts("  kill N  "); reset_color(); kputs("end process N (no N = all)\n");
     set_color(C_LCYAN); vga_puts("  mkdemo  "); reset_color(); kputs("create demo.nxp sample program\n");
     set_color(C_LCYAN); vga_puts("  format  "); reset_color(); kputs("format NovaFS\n");
     set_color(C_LCYAN); vga_puts("  fsinfo  "); reset_color(); kputs("filesystem info\n");
@@ -685,14 +722,14 @@ static void cmd_acpi(void)
 
 
 /* ============================================================
- * .nxp program loader
+ * .nxp program loader / process spawner
  *   format : flat binary, "NXP\x01" magic (4B) + code
- *   load   : 0x00300000, entry = base+4
- *   entry  : EAX = pointer to nxp_api_t below, fresh stack,
- *            returns with `ret` or api->exit()
+ *   slots  : 4 processes, per-slot link base (see paging.c):
+ *            name.nxp    -> 0x300000    name.1.nxp -> 0x320000
+ *            name.2.nxp  -> 0x340000    name.3.nxp -> 0x360000
+ *   entry  : EAX = pointer to nxp_api_t, fresh per-slot stack,
+ *            ends via `ret`/api->exit() into the scheduler
  * ============================================================ */
-#define NXP_BASE   0x00300000u
-#define NXP_STACK  0x00500000u
 
 typedef struct {
     uint32_t magic;                 /* 'NXP1' */
@@ -712,11 +749,25 @@ typedef struct {
     void (*set_color)(uint32_t fg);                 /* VGA attr foreground */
     int  (*getuser)(char *buf, uint32_t max);      /* current login name */
     int  (*getdate)(char *buf, uint32_t max);      /* formatted RTC date */
+    int  (*readfile)(const char *name, uint8_t *buf, uint32_t max);
+                                                   /* read a NovaFS file */
+    int  (*spawn)(const char *name);              /* new process        */
+    int  (*procs)(char *buf, uint32_t max);       /* list live processes */
 } nxp_api_t;
 
 static void nxp_api_putc(char c)              { kput(c); }
 static void nxp_api_puts(const char *s)       { if (s) kputs(s); }
-static int  nxp_api_getchar(void)             { return kb_read(); }
+static int  nxp_api_getchar(void)
+{
+    int c = kb_poll();
+    if (c > 0) {                        /* DIAG: decoded key + value */
+        serial_puts("[k=");
+        serial_putc(hx2((unsigned)c >> 4));
+        serial_putc(hx2((unsigned)c));
+        serial_putc(']');
+    }
+    return c;
+}
 static void nxp_api_exit(void)                { }   /* Ring3 exit goes through the syscall stub */
 static void nxp_api_pixel(uint32_t x, uint32_t y, uint32_t rgb) { gfx_pixel((int)x, (int)y, rgb); }
 static void nxp_api_fill(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t rgb)
@@ -758,6 +809,37 @@ static int  nxp_api_getuser(char *buf, uint32_t max)
 }
 static int nxp_api_getdate(char *buf, uint32_t max) { return format_date(buf, (int)max); }
 
+static int slot_from_name(const char *name);
+static int nxp_load_slot(const char *name, int slot);
+
+/* spawn an .nxp as a new process (slot chosen by the file name) */
+static int nxp_api_spawn(const char *name)
+{
+    if (!name || !*name) return -1;
+    int slot = slot_from_name(name);
+    if (nxp_load_slot(name, slot) < 0) return -1;
+    return proc_spawn(slot, name);
+}
+
+/* list live processes as "pid name" lines (nsh `procs` command) */
+static int nxp_api_procs(char *buf, uint32_t max)
+{
+    if (!buf || max == 0) return -1;
+    return proc_list(buf, max);
+}
+
+/* read a NovaFS file (current dir) into a user buffer - the file access
+ * nsh.nxp needs to load .nsh scripts, handy for any other program too */
+static int nxp_api_readfile(const char *name, uint8_t *buf, uint32_t max)
+{
+    if (!name || !buf || max == 0 || !fs_is_ready()) return -1;
+    int sz = fs_size(name);
+    if (sz < 0) return -1;
+    fs_read(name, buf, max);
+    if (sz > (int)max) sz = (int)max;
+    return sz;
+}
+
 static nxp_api_t nxp_api = {
     0x3150584Eu, 1,
     nxp_api_putc, nxp_api_puts, nxp_api_getchar, nxp_api_exit,
@@ -766,30 +848,96 @@ static nxp_api_t nxp_api = {
     nxp_api_getkey,
     nxp_api_mouse,
     nxp_api_getpixel,
-    nxp_api_cls, nxp_api_setcolor, nxp_api_getuser, nxp_api_getdate
+    nxp_api_cls, nxp_api_setcolor, nxp_api_getuser, nxp_api_getdate,
+    nxp_api_readfile, nxp_api_spawn, nxp_api_procs
 };
 
-static void cmd_run(const char *name)
+/* "name.D.nxp" selects process slot D (0-3); plain "name.nxp" = slot 0 */
+static int slot_from_name(const char *name)
 {
-    if(!name || !*name){ kputs("usage: run <file.nxp>\n"); return; }
-    if(!fs_is_ready()){ kputs("NovaFS not formatted. Use 'format'.\n"); return; }
+    int n = str_len(name);
+    if (n > 6 &&
+        name[n-1]=='p' && name[n-2]=='x' && name[n-3]=='n' &&
+        name[n-4]=='.' && name[n-6]=='.' &&
+        name[n-5] >= '0' && name[n-5] <= '3')
+        return name[n-5] - '0';
+    return 0;
+}
+
+/* load an .nxp image into a process slot; 0 = ok, -1 = error (printed) */
+static int nxp_load_slot(const char *name, int slot)
+{
+    if(!fs_is_ready()){ kputs("NovaFS not formatted. Use 'format'.\n"); return -1; }
     int sz = fs_size(name);
-    if(sz < 5){ kputs("run: no such file\n"); return; }
+    if(sz < 5){ kputs("run: no such file\n"); return -1; }
     if(sz > TXT_MAX) sz = TXT_MAX;
     for(int i=0;i<TXT_MAX;i++) textbuf[i]=0;
     fs_read(name, (uint8_t*)textbuf, TXT_MAX);
     if(textbuf[0]!='N' || textbuf[1]!='X' || textbuf[2]!='P' || textbuf[3]!=1){
-        kputs("run: not a .nxp program (bad magic)\n"); return;
+        kputs("run: not a .nxp program (bad magic - .nsh? try nsh.nxp)\n"); return -1;
     }
-    uint8_t *dst = (uint8_t *)NXP_BASE;
+    uint8_t *dst = (uint8_t *)proc_slot_base(slot);
     for(int i=0;i<sz;i++) dst[i] = (uint8_t)textbuf[i];
     for(int i=sz;i<8192;i++) dst[i] = 0;   /* slack + BSS */
-    kputs("[nxp] running "); kputs(name); kputs(" in ring3...\n");
-    ring3_setup_tramp();
-    uint32_t *sp = (uint32_t *)NXP_STACK;
-    *(--sp) = g_nxp_exit_stub;             /* program `ret` -> exit stub */
-    ring3_enter(NXP_BASE + 4, (uint32_t)sp, NXP_TRAMP_API);
-    kputs("[nxp] program returned\n");
+    return 0;
+}
+
+/* shell `run`: spawn, park the shell, and let the scheduler run until
+ * every process is gone (or F12 kills them all) */
+static void cmd_run(const char *name)
+{
+    if(!name || !*name){ kputs("usage: run <file.nxp>\n"); return; }
+    int slot = slot_from_name(name);
+    if(nxp_load_slot(name, slot) < 0) return;
+    int pid = proc_spawn(slot, name);
+    if(pid < 0){ kputs("run: slot busy (try name.1/2/3.nxp)\n"); return; }
+    kputs("[proc] started "); kputs(name);
+    kputs(" pid="); kput_dec((unsigned)pid);
+    kputs("  (F11 suspend / F12 kill)\n");
+    main_checkpoint();                     /* park the shell context */
+    proc_set_current(slot);                /* first tick must save, not roll back */
+    serial_puts("[jmp]\n");                /* DIAG: entering the process */
+    jmp_user(proc_frame(slot));            /* in until all exit */
+    serial_puts("[ret]\n");                /* DIAG: scheduler released us */
+    kputs(proc_any() ? "[proc] suspended - 'fg' resumes, 'kill' ends\n"
+                     : "[proc] all processes exited\n");
+}
+
+/* shell `procs`: with F11 available, suspended processes are visible here */
+static void cmd_procs(void)
+{
+    char pb[128];
+    int n = proc_list(pb, sizeof pb);
+    if (n <= 0) { kputs("no processes (run X.nxp to spawn)\n"); return; }
+    kputs("pid st name\n");
+    kputs(pb);
+}
+
+/* shell `fg`: thaw suspended processes and re-enter the scheduler */
+static void cmd_fg(void)
+{
+    if (!proc_stopped_any()) { kputs("fg: nothing suspended\n"); return; }
+    proc_resume_all();
+    int slot = proc_next();
+    if (slot < 0) { kputs("fg: nothing to run\n"); return; }
+    kputs("[proc] resumed\n");
+    main_checkpoint();
+    proc_set_current(slot);
+    jmp_user(proc_frame(slot));
+    kputs("[proc] all processes exited\n");
+}
+
+/* shell `kill [pid]`: end one process, or all of them */
+static void cmd_kill(const char *args)
+{
+    if (!proc_any()) { kputs("kill: no processes\n"); return; }
+    if (!args || !*args) { proc_kill_all(); kputs("killed all\n"); return; }
+    if (args[0] >= '1' && args[0] <= '4' && args[1] == 0) {
+        if (proc_kill(args[0] - '0') < 0) kputs("kill: no such pid\n");
+        else kputs("killed\n");
+        return;
+    }
+    kputs("usage: kill [pid 1-4]\n");
 }
 
 /* built-in demo program (hand-assembled, linked at 0x300000):
@@ -860,11 +1008,14 @@ static void count_cb(const char *name, int type, uint32_t size)
 static void cmd_fsinfo(void)
 {
     if(!fs_is_ready()){ kputs("NovaFS not formatted. Use 'format'.\n"); return; }
-    kputs("NovaFS status:\n");
-    kputs("  max inodes  : 256\n");
-    kputs("  max blocks  : 32768 (512B each)\n");
-    kputs("  max file    : 3072 B (6 direct blocks)\n");
-    fs_getcwd(cwdbuf, sizeof(cwdbuf));
+    uint32_t ub = 0, ui = 0, uby = 0;
+    fs_space(&ub, &ui, &uby);
+    kputs("NovaFS disk:\n");
+    kputs("  blocks used : "); kput_dec(ub); kputs(" / 32768 (");
+    kput_dec(32768u - ub); kputs(" free, 512B each)\n");
+    kputs("  space used  : "); kput_dec(uby); kputs(" B / 16 MB\n");
+    kputs("  inodes used : "); kput_dec(ui); kputs(" / 256\n");
+    fs_getcwd(cwdbuf, sizeof cwdbuf);
     kputs("  current dir : "); kputs(cwdbuf); kput('\n');
     g_file_count = 0;
     fs_list(count_cb);
@@ -1011,20 +1162,40 @@ static void process_cmd(void) {
     else if (str_eq(cmd, "write")) cmd_write(args);
     else if (str_eq(cmd, "rm"))    cmd_rm(args);
     else if (str_eq(cmd, "run"))   cmd_run(args);
+    else if (str_eq(cmd, "procs")) cmd_procs();
+    else if (str_eq(cmd, "fg"))    cmd_fg();
+    else if (str_eq(cmd, "kill"))  cmd_kill(args);
+    else if (str_eq(cmd, "ps"))    cmd_procs();
     else if (str_eq(cmd, "mkdemo"))cmd_mkdemo();
     else { kputs("Unknown command: "); kputs(cmd); kputs("  (try 'help')\n"); }
 }
 
 static void shell_run(void) {
     for (;;) {
+        int cmdcur = 0;                          /* cursor inside cmdline */
         cmdlen = 0;
         shell_prompt();
         for (;;) {
             char c = kb_read();
-            if ((uint8_t)c < 0x20 && c != '\n' && c != '\b') continue; /* arrows etc. */
-            if (c == '\n') { kput('\n'); break; }
-            else if (c == '\b') { if (cmdlen > 0) { cmdlen--; kput('\b'); } }
-            else if (cmdlen < CMD_MAX - 1) { cmdline[cmdlen++] = c; kput(c); }
+            if (c == K_LEFT) {                   /* cursor left (no erase) */
+                if (cmdcur > 0) { cmdcur--; kput('\v'); }
+            } else if (c == K_RIGHT) {           /* cursor right */
+                if (cmdcur < cmdlen) { kput(cmdline[cmdcur]); cmdcur++; }
+            } else if (c == '\n') { kput('\n'); break; }
+            else if (c == '\b') {                /* delete before cursor */
+                if (cmdcur > 0) {
+                    for (int i = cmdcur - 1; i < cmdlen - 1; i++) cmdline[i] = cmdline[i + 1];
+                    cmdlen--; cmdcur--; kput('\b');
+                    for (int i = cmdcur; i < cmdlen; i++) kput(cmdline[i]);
+                    for (int i = cmdcur; i < cmdlen; i++) kput('\v');
+                }
+            } else if ((uint8_t)c < 0x20) continue;              /* other control keys */
+            else if (cmdlen < CMD_MAX - 1) {     /* insert at the cursor */
+                for (int i = cmdlen; i > cmdcur; i--) cmdline[i] = cmdline[i - 1];
+                cmdline[cmdcur++] = c; cmdlen++; kput(c);
+                for (int i = cmdcur; i < cmdlen; i++) kput(cmdline[i]);
+                for (int i = cmdcur; i < cmdlen; i++) kput('\v');
+            }
         }
         process_cmd();
         if (g_logout) return;                    /* back to login */
@@ -1487,6 +1658,7 @@ void kmain(void) {
     gfx_probe("post-ring3");
     nxp_api.scr_w = gfx_active() ? (uint32_t)(gfx_cols() * 8) : 0;
     nxp_api.scr_h = gfx_active() ? (uint32_t)(gfx_rows() * 16) : 0;
+    ring3_setup_tramp();                       /* syscall stubs, once */
 
     kput('\n');
     login_run();

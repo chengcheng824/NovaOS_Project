@@ -19,6 +19,32 @@ extern void kput_dec(unsigned v);
 extern void isr_syscall(void);
 extern uint32_t isr_fault_table[];   /* 32 stub addresses */
 void ring3_leave(void);
+extern void isr_irq0(void);          /* IRQ0 preemption gate          */
+extern void jmp_user(uint32_t *fr);  /* iret into a saved user frame  */
+
+/* kernel.c: consume raw make-scancode `raw` from the PS/2 ring */
+extern int kb_take_raw(uint8_t raw);
+/* kernel.c: F11/F12 seen by a process's own keyboard poll (0 = none) */
+extern int kb_take_hotkey(void);
+
+static inline void outb(uint16_t port, uint8_t v)
+{
+    __asm__ volatile ("outb %0, %1" : : "a"(v), "Nd"(port));
+}
+static inline uint8_t inb(uint16_t port)
+{
+    uint8_t v;
+    __asm__ volatile ("inb %1, %0" : "=a"(v) : "Nd"(port));
+    return v;
+}
+
+/* COM1 trace for the scheduler (serial.log diagnostics) */
+static void ser(char c)
+{
+    int t = 100000;
+    while (!(inb(0x3F8 + 5) & 0x20) && --t) ;
+    outb(0x3F8, (uint8_t)c);
+}
 
 /* ---- fixed placements (linker gives only 16-byte alignment) ---- */
 #define PDE_ADDR          0x00141000u
@@ -41,21 +67,179 @@ typedef struct {
     fn5 putc, puts, getchar, exit;
     uint32_t scr_w, scr_h;
     fn5 pixel, fill_rect, text, getkey, mouse, get_pixel;
-    fn5 cls, set_color, getuser, getdate;
+    fn5 cls, set_color, getuser, getdate, readfile, spawn, procs;
 } kapi_t;
 static const kapi_t *g_api;
 
 /* register frame pushed by pushad + CPU fault frame after it:
    [0]edi [1]esi [2]ebp [3]esp [4]ebx [5]edx [6]ecx [7]eax
-   [8]err [9]eip [10]cs [11]eflags                              */
-typedef struct { uint32_t r[12]; } regs_t;
+   [8]err [9]eip [10]cs [11]eflags [12]user_esp (PL3 frames)     */
+typedef struct { uint32_t r[13]; } regs_t;
 
 /* syscall numbers == trampoline stub order */
 enum { SYS_PUTC, SYS_PUTS, SYS_GETCHAR, SYS_EXIT,
        SYS_PIXEL, SYS_FILL, SYS_TEXT, SYS_GETKEY,
        SYS_MOUSE, SYS_GETPIXEL,
-       SYS_CLS, SYS_SETCOLOR, SYS_GETUSER, SYS_GETDATE,
-       SYS_COUNT };
+       SYS_CLS, SYS_SETCOLOR, SYS_GETUSER, SYS_GETDATE, SYS_READFILE,
+       SYS_SPAWN, SYS_PROCS, SYS_COUNT };
+
+/* ============================================================
+ * Processes: 4 fixed slots, ONE address space (no CR3 switch).
+ * Each slot owns a link base (the build emits a binary per slot)
+ * and a stack region - all inside the user-mapped 3..5MB window.
+ * ============================================================ */
+#define NSLOT  4
+#define NSAVE  13                       /* pushad(8) + eip cs efl esp ss */
+enum { PST_FREE = 0, PST_READY, PST_FRESH, PST_STOPPED };
+
+static const uint32_t slot_base[NSLOT]  = { 0x00300000u, 0x00320000u,
+                                            0x00340000u, 0x00360000u };
+static const uint32_t slot_stack[NSLOT] = { 0x00500000u, 0x004C0000u,
+                                            0x00480000u, 0x00440000u };
+
+extern uint32_t g_nxp_exit_stub;    /* defined below, set by setup_tramp */
+
+typedef struct {
+    uint32_t state;                     /* PST_*                  */
+    uint32_t fr[NSAVE];                 /* saved iret frame       */
+    char     name[13];                  /* program file name      */
+} pcb_t;
+static pcb_t g_pcb[NSLOT];
+static int  g_cur  = -1;                /* pcb interrupted/running */
+static int  g_last = -1;                /* last scheduled, for RR  */
+static uint32_t g_tik;                  /* DIAG: tick counter */
+
+uint32_t proc_slot_base(int slot) { return slot_base[slot]; }
+
+int proc_spawn(int slot, const char *name)
+{
+    if (slot < 0 || slot >= NSLOT || g_pcb[slot].state != PST_FREE) return -1;
+    pcb_t *p = &g_pcb[slot];
+    for (int i = 0; i < NSAVE; i++) p->fr[i] = 0;
+    p->fr[7]  = NXP_TRAMP_API;          /* user EAX = api table  */
+    p->fr[8]  = slot_base[slot] + 4;    /* entry eip             */
+    p->fr[9]  = 0x1B;                   /* user cs               */
+    p->fr[10] = 0x202;                  /* eflags, IF=1: preemptible */
+    *(uint32_t *)(slot_stack[slot] - 4) = g_nxp_exit_stub;
+    p->fr[11] = slot_stack[slot] - 4;   /* esp: `ret` hits the exit stub */
+    p->fr[12] = 0x23;                   /* user ss               */
+    p->state = PST_READY;
+    int i = 0;
+    while (name && name[i] && i < 12) { p->name[i] = name[i]; i++; }
+    p->name[i] = 0;
+    return slot + 1;
+}
+
+/* fill buf with "pid st name\n" lines for live processes; returns count
+ * (st: r = ready/running, s = suspended) */
+int proc_list(char *buf, uint32_t max)
+{
+    int n = 0;
+    uint32_t o = 0;
+    for (int i = 0; i < NSLOT; i++) {
+        if (g_pcb[i].state == PST_FREE) continue;
+        n++;
+        if (o + 4 >= max) continue;     /* no room: count only */
+        buf[o++] = (char)('1' + i);     /* pid = slot + 1 (1 digit) */
+        buf[o++] = ' ';
+        buf[o++] = (g_pcb[i].state == PST_STOPPED) ? 's' : 'r';
+        buf[o++] = ' ';
+        int j = 0;
+        while (g_pcb[i].name[j] && o < max - 2) buf[o++] = g_pcb[i].name[j++];
+        buf[o++] = '\n';
+    }
+    if (max) buf[o < max ? o : max - 1] = 0;
+    return n;
+}
+
+uint32_t *proc_frame(int slot) { return g_pcb[slot].fr; }
+
+/* round robin: next schedulable pcb after g_last (skips free+suspended) */
+static int sched_pick(void)
+{
+    for (int k = 1; k <= NSLOT; k++) {
+        int i = (g_last + k) % NSLOT;
+        if (g_pcb[i].state == PST_READY || g_pcb[i].state == PST_FRESH)
+            return i;
+    }
+    return -1;
+}
+
+void proc_kill_all(void)
+{
+    for (int i = 0; i < NSLOT; i++) g_pcb[i].state = PST_FREE;
+    g_cur = -1;
+}
+
+int proc_any(void)
+{
+    for (int i = 0; i < NSLOT; i++)
+        if (g_pcb[i].state != PST_FREE) return 1;
+    return 0;
+}
+
+int proc_stopped_any(void)
+{
+    for (int i = 0; i < NSLOT; i++)
+        if (g_pcb[i].state == PST_STOPPED) return 1;
+    return 0;
+}
+
+void proc_resume_all(void)
+{
+    for (int i = 0; i < NSLOT; i++)
+        if (g_pcb[i].state == PST_STOPPED) g_pcb[i].state = PST_READY;
+}
+
+int proc_next(void) { return sched_pick(); }
+
+/* the shell (re)enters a process directly via jmp_user: mark it as the
+ * running one so the first tick saves instead of rolling it back */
+void proc_set_current(int slot) { g_cur = slot; g_last = slot; }
+
+int proc_kill(int pid)
+{
+    if (pid < 1 || pid > NSLOT || g_pcb[pid - 1].state == PST_FREE) return -1;
+    g_pcb[pid - 1].state = PST_FREE;
+    return 0;
+}
+
+static void proc_stop_all(void)
+{
+    for (int i = 0; i < NSLOT; i++)
+        if (g_pcb[i].state != PST_FREE) g_pcb[i].state = PST_STOPPED;
+    g_cur = -1;
+}
+
+/* IRQ0 preemption: only user-mode frames are ever switched, so the
+ * kernel is never re-entered. The stub hands us the pushad area; the
+ * CPU iret frame (eip cs efl [esp ss]) sits right above it. */
+void irq0_dispatch(uint32_t *f)
+{
+    outb(0x20, 0x20);                   /* EOI first: we may not iret */
+    if (!(++g_tik & 0xFF)) ser('t');    /* DIAG: timer heartbeat ~2.6s */
+    if ((f[9] & 3) != 3) return;        /* interrupted the kernel: skip -
+                                         * hotkeys stay queued for next tick */
+    if (g_cur >= 0) {                   /* snapshot current before anything */
+        for (int i = 0; i < NSAVE; i++) g_pcb[g_cur].fr[i] = f[i];
+        g_pcb[g_cur].state = PST_READY;
+    }
+    if (kb_take_raw(0x57) && proc_any()) {      /* F11: freeze all */
+        proc_stop_all();
+        ring3_leave();                  /* back to the shell */
+    }
+    if (kb_take_raw(0x58) && proc_any()) {      /* F12: kill all */
+        proc_kill_all();
+        ring3_leave();
+    }
+    int nx = sched_pick();
+    if (nx < 0) return;                 /* alone: keep running */
+    int prev = g_cur;
+    for (int i = 0; i < NSAVE; i++) f[i] = g_pcb[nx].fr[i];
+    g_cur = nx;
+    g_last = nx;
+    if (nx != prev) ser('S');           /* DIAG: an actual task change */
+}
 
 uint32_t g_nxp_exit_stub;
 
@@ -81,7 +265,19 @@ void syscall_dispatch(regs_t *r)
     case SYS_PUTC:     g_api->putc(a[0], 0, 0, 0, 0); break;
     case SYS_PUTS:     g_api->puts(uptr(a[0]), 0, 0, 0, 0); break;
     case SYS_GETCHAR:  ret = g_api->getchar(0, 0, 0, 0, 0); break;
-    case SYS_EXIT:     ring3_leave();           /* never returns */
+    case SYS_EXIT: {
+        /* process death: reuse this very frame for the next process */
+        if (g_cur >= 0) g_pcb[g_cur].state = PST_FREE;
+        g_cur = -1;
+        int nx = sched_pick();
+        if (nx < 0) ring3_leave();      /* none left: back to the shell */
+        for (int i = 0; i < NSAVE; i++) r->r[i] = g_pcb[nx].fr[i];
+        g_cur = nx;
+        g_last = nx;
+        return;                         /* frame replaced: keep its EAX */
+    }
+    case SYS_SPAWN:    ret = g_api->spawn(uptr(a[0]), 0, 0, 0, 0); break;
+    case SYS_PROCS:    ret = g_api->procs(uptr(a[0]), a[1], 0, 0, 0); break;
     case SYS_PIXEL:    g_api->pixel(a[0], a[1], a[2], 0, 0); break;
     case SYS_FILL:     g_api->fill_rect(a[0], a[1], a[2], a[3], a[4]); break;
     case SYS_TEXT:     g_api->text(a[0], a[1], uptr(a[2]), a[3], 0); break;
@@ -94,6 +290,21 @@ void syscall_dispatch(regs_t *r)
     case SYS_SETCOLOR: g_api->set_color(a[0], 0, 0, 0, 0); break;
     case SYS_GETUSER:  ret = g_api->getuser(uptr(a[0]), a[1], 0, 0, 0); break;
     case SYS_GETDATE:  ret = g_api->getdate(uptr(a[0]), a[1], 0, 0, 0); break;
+    case SYS_READFILE: ret = g_api->readfile(uptr(a[0]), uptr(a[1]), a[2], 0, 0); break;
+    }
+
+    /* F11/F12 pressed while a process was polling the keyboard: the
+     * process consumed the raw scancode before any tick could see it,
+     * so act on it right here where the full frame is in hand */
+    int hk = kb_take_hotkey();
+    if (hk == 0x57 && g_cur >= 0) {     /* F11: freeze all, back to shell */
+        for (int i = 0; i < NSAVE; i++) g_pcb[g_cur].fr[i] = r->r[i];
+        proc_stop_all();                /* everything STOPPED (cur included) */
+        ring3_leave();                  /* never returns */
+    }
+    if (hk == 0x58 && g_cur >= 0) {     /* F12: kill all, back to shell */
+        proc_kill_all();
+        ring3_leave();                  /* never returns */
     }
     r->r[7] = ret;                              /* return value -> EAX */
 }
@@ -224,7 +435,11 @@ void fault_dispatch(regs_t *r, uint32_t vector)   /* exception 0..31, never retu
             for (int i = 0; i < 6; i++) { kput(' '); kput_hex(us[i]); }
         }
         kput('\n');
-        ring3_leave();                          /* kill the program */
+        /* kill the offender and keep the rest running */
+        if (g_cur >= 0) { g_pcb[g_cur].state = PST_FREE; g_cur = -1; }
+        int nx = sched_pick();
+        if (nx >= 0) jmp_user(g_pcb[nx].fr);    /* never returns */
+        ring3_leave();                          /* none left: shell */
     }
 
     /* kernel fault — show BSOD and halt */
@@ -257,7 +472,7 @@ static uint8_t *emit_stub(uint8_t *p, uint32_t sysno, int nargs)
 
 void ring3_setup_tramp(void)
 {
-    static const uint8_t nargs[SYS_COUNT] = { 1,1,0,0,3,5,4,0,3,2, 0,1,2,2 };
+    static const uint8_t nargs[SYS_COUNT] = { 1,1,0,0,3,5,4,0,3,2, 0,1,2,2,3,1,2 };
     uint8_t *p = (uint8_t *)NXP_TRAMP_BASE;
     uint32_t stub[SYS_COUNT];
 
@@ -278,6 +493,8 @@ void ring3_setup_tramp(void)
     t[12] = stub[SYS_MOUSE];   t[13] = stub[SYS_GETPIXEL];
     t[14] = stub[SYS_CLS];     t[15] = stub[SYS_SETCOLOR];
     t[16] = stub[SYS_GETUSER]; t[17] = stub[SYS_GETDATE];
+    t[18] = stub[SYS_READFILE]; t[19] = stub[SYS_SPAWN];
+    t[20] = stub[SYS_PROCS];
 }
 
 /* ---- descriptor helpers ---- */
@@ -334,6 +551,23 @@ static void map_init(void)
     }
 }
 
+/* ---- PIC remap + PIT @100Hz + IRQ0 gate: the preemption heart ----
+ * Runs at the very end of ring3_init. Only IRQ0 is unmasked; keyboard,
+ * mouse and disks stay polled exactly as before. */
+static void pic_pit_init(void)
+{
+    outb(0x20, 0x11); outb(0xA0, 0x11);     /* ICW1: cascade + ICW4  */
+    outb(0x21, 0x20); outb(0xA1, 0x28);     /* ICW2: vectors 32 / 40 */
+    outb(0x21, 0x04); outb(0xA1, 0x02);     /* ICW3: cascade wiring  */
+    outb(0x21, 0x01); outb(0xA1, 0x01);     /* ICW4: 8086 mode       */
+    outb(0x21, 0xFE); outb(0xA1, 0xFF);     /* unmask IRQ0 only      */
+    outb(0x43, 0x34);                       /* ch0, mode 2, binary   */
+    outb(0x40, 0x9C);                       /* divisor 11932 = 100Hz */
+    outb(0x40, 0x2E);
+    set_gate(0x20, (void (*)(void))isr_irq0, 0x8E);
+    __asm__ volatile ("sti");               /* preemption goes live  */
+}
+
 void ring3_init(const void *api_table)
 {
     g_api = (const kapi_t *)api_table;
@@ -355,10 +589,6 @@ void ring3_init(const void *api_table)
         set_gate(i, (void(*)(void))isr_fault_table[i], 0x8E);
     }
     set_gate(0x80, isr_syscall, 0xEE);          /* syscall gate, DPL 3 */
-
-    /* mask the PIC: everything is polled, no vectors 32+ are installed */
-    __asm__ volatile ("outb %0, %1" : : "a"((uint8_t)0xFF), "Nd"(0xA1));
-    __asm__ volatile ("outb %0, %1" : : "a"((uint8_t)0xFF), "Nd"(0x21));
 
     map_init();
 
@@ -388,4 +618,6 @@ void ring3_init(const void *api_table)
     uint16_t sel = 0x28;
     __asm__ volatile ("ltr %0" : : "rm"(sel));
     __asm__ volatile ("lidt %0" : : "m"(idtr));
+
+    pic_pit_init();
 }

@@ -1,6 +1,6 @@
 # NovaOS
 
-一个简洁的 32 位 C 语言操作系统内核，带 **多用户登录**（开机认证 + 密码哈希持久化）、**Ring3 用户态**（分页 + TSS + IDT + int 0x80 syscall）、交互式 shell `NovaSh`、**NovaFS**（256 inode / 多级目录 / 递归删除）、**运行时 ACPI/AML 解析关机**、**Bochs VBE 图形驱动（1024x768x32 真彩控制台）**、**Windows BSOD 风格红屏崩溃页** 与美化启动画面，可用 QEMU 直接启动测试。（建议使用 QEMU 6.2，支持最好）
+一个简洁的 32 位 C 语言操作系统内核，带 **多用户登录**（开机认证 + 密码哈希持久化）、**Ring3 用户态**（分页 + TSS + IDT + int 0x80 syscall）、**抢占式多进程**（PIT 100Hz + Ring3-only 抢占 + 4 进程槽）、**.nsh 批处理脚本**（.bat 兼容语法）、交互式 shell `NovaSh`（方向键行内编辑）、**NovaFS**（256 inode / 多级目录 / 递归删除）、**运行时 ACPI/AML 解析关机**、**Bochs VBE 图形驱动（1024x768x32 真彩控制台）**、**Windows BSOD 风格红屏崩溃页** 与美化启动画面，可用 QEMU 直接启动测试。（建议使用 QEMU 6.2，支持最好）
 
 ## 目录结构
 
@@ -11,14 +11,24 @@ NovaOS/
 │   ├── stage2.asm          # Stage2: A20/GDT/进入保护模式/拷贝内核/跳转
 │   └── kernel_entry.inc    # 内核布局常量 (加载地址 0x100000)
 ├── kernel/
-│   ├── entry.asm           # 32位内核入口 stub (设栈/段, 调用 kmain)
-│   ├── kernel.c            # 内核主体: VGA/键盘/串口/RTC + 登录/多用户 + NovaSh shell
+│   ├── entry.asm           # 32位内核入口 stub (设栈/段, 调用 kmain) + syscall/fault/IRQ0 门
+│   ├── kernel.c            # 内核主体: VGA/键盘/串口/RTC + 登录/多用户 + NovaSh + 进程命令
+│   ├── paging.c / paging.h # Ring3: 分页/GDT/TSS/IDT/syscall + PIC/PIT + 多进程调度器
 │   ├── ata.c / ata.h       # 磁盘 PIO ATA 驱动 (LBA 读写 512B 扇区)
-│   ├── novafs.c / novafs.h   # NovaFS 文件系统: 多级目录 + 递归删除
+│   ├── novafs.c / novafs.h   # NovaFS 文件系统: 多级目录 + 递归删除 + 磁盘用量统计
 │   ├── acpi.c / acpi.h     # 最小 ACPI/AML 解析器 (RSDP→FADT→DSDT, 解析 \_S5 关机)
 │   ├── gfx.c / gfx.h       # Bochs VBE 图形驱动: 1024x768x32 真彩控制台 (128x48)
 │   ├── stdint.h            # 最小 stdint
 │   └── link.ld             # 链接脚本 (段紧凑于 0x100000)
+├── programs/               # Ring3 用户程序源码 (build 自动编译注入)
+│   ├── nxp.h / nxp_entry.c # .nxp API 头 (21 项) + 入口跳板
+│   ├── hello.c             # 静态演示 (彩条)
+│   ├── ringok.c / ringbad.c  # Ring3 健全性 / 用户态故障测试
+│   ├── paint.c             # 鼠标画板
+│   └── nsh.c               # nsh.nxp: 子集 shell + .nsh 脚本引擎
+├── scripts/                # .nsh 示例脚本 (build 注入 data-seed.img)
+│   ├── hello.nsh           # 第一个脚本：变量 / 回显 / pause
+│   └── count.nsh           # if/goto 循环倒数 3-2-1
 ├── build.ps1  build.bat    # 构建脚本 (NASM + gcc + ld + objcopy -> disk.img + data-seed.img)
 ├── run.ps1    run.bat      # QEMU 启动脚本 (双盘: 引导盘 + 数据盘, isa-debug-exit + 串口日志)
 └── README.md
@@ -122,7 +132,7 @@ Welcome, root. Type 'help' for commands.
 | `su 名`       | 切换用户：root 免密，其他用户需输目标密码；切换后落到对方家目录 |
 | `logout`      | 注销，返回登录界面                          |
 
-特权模型（无多任务下的简化版）：只有 **root** 能执行 `useradd` / `userdel` / `format`，
+特权模型：只有 **root** 能执行 `useradd` / `userdel` / `format`，
 其他用户执行会得到 `permission denied`；文件级权限位暂未实现，所有用户仍能读写全部文件。
 
 ### 通用
@@ -140,8 +150,12 @@ Welcome, root. Type 'help' for commands.
 | `reboot`   | 重启（QEMU CPU reset）               |
 | `shutdown` | 关机（运行时解析 RSDP→FADT→DSDT，经 `\_S5`/PM1_CNT 断电） |
 | `halt`     | CLI 停机                             |
-| `fsinfo`   | NovaFS 概览 + 当前目录条目数          |
+| `fsinfo`   | NovaFS **磁盘用量**（已用/空闲块、已用字节、inode）+ 当前目录条目数 |
 | `format`   | 强制重新格式化 NovaFS                 |
+| `run  名`  | 启动 .nxp 为进程并挂起 shell（见「多进程」） |
+| `procs`    | 列出进程（`ps` 同义）；`s`=挂起 `r`=就绪 |
+| `fg`       | 恢复全部挂起的进程                    |
+| `kill N`   | 结束进程 N（不带 N = 结束全部）       |
 
 ### 目录操作
 
@@ -162,10 +176,84 @@ Shell prompt 显示 当前用户 和当前工作目录：`root@novaos:/docs/sub#
 | `cat  名`    | 显示文件内容                                             |
 | `write 名`   | 新建/覆盖文件。逐行输入，**单独一行输入 `.` 结束**        |
 | `rm  名`     | 删除文件（目录请用 `rmdir` / `rd`）                      |
-| `run  名`    | 执行 .nxp 程序                                           |
 | `mkdemo`     | 生成示例程序 demo.nxp（然后 `run demo.nxp`）             |
 
 注：单个文件大小上限 6 块 = 3072 B（直接块 NDIRECT=6）。
+
+## 多进程
+
+NovaOS 拥有**抢占式多任务**：PIC 重映射 + PIT 定时器 100Hz 产生 IRQ0，调度器只在
+**打断用户态（Ring 3）时切换任务**，内核态永不抢占 —— 从结构上杜绝内核重入问题。
+
+### 进程槽位
+
+| 槽位 | 链接基址    | 用户栈顶    | 程序文件名       |
+|------|-------------|-------------|------------------|
+| 0    | 0x300000    | 0x500000    | `名.nxp`         |
+| 1    | 0x320000    | 0x4C0000    | `名.1.nxp`       |
+| 2    | 0x340000    | 0x480000    | `名.2.nxp`       |
+| 3    | 0x360000    | 0x440000    | `名.3.nxp`       |
+
+- `.nxp` 是按固定地址链接的平坦二进制，无法重定位，所以 **build.ps1 为每个程序按
+  4 个槽位基址各链接一份**（`paint.nxp` / `paint.1.nxp` / …）。同一程序想开两份？
+  `run paint.nxp` + `run paint.1.nxp` 即可
+- 单一地址空间、**无 CR3 切换**：任务切换只保存/恢复 13 字寄存器帧（pushad +
+  eip/cs/eflags/esp/ss），TSS ESP0 栈每次系统调用完整展开，天然无残留
+- 最多 4 个并发进程；`procs`（或 `ps`）查看，pid = 槽位 + 1
+
+### 使用方式
+
+```
+root@novaos:/# run nsh.nxp            ← shell 挂起自身，进入调度器
+[proc] started nsh.nxp pid=1  (F11 suspend / F12 kill)
+  （nsh 内）run paint.1.nxp           ← 进程内用 API->spawn 再拉起进程，自己继续跑
+pid 2
+  （nsh 内）procs                     ← 1 r nsh.nxp / 2 r paint.1.nxp
+  按 F11                              ← 全部冻结，回到内核 shell
+[proc] suspended - 'fg' resumes, 'kill' ends
+root@novaos:/# procs                  ← 1 s nsh.nxp / 2 s paint.1.nxp
+root@novaos:/# fg                     ← 解冻，重新进入调度器
+root@novaos:/# （F12 = 不挂起直接全杀回 shell）
+[proc] all processes exited
+```
+
+- `run` 会**挂起 shell**：只要有进程活着就回不到提示符；全部退出（或 F12/F11）才返回
+- 用户程序崩溃只死它自己，其余进程继续跑；`fg` 从保存的寄存器帧精确恢复
+- `getchar()` 已改为**非阻塞**（无键返回 -1），交互程序在自己的时间片里轮询
+
+### 已知限制（v1 设计取舍）
+
+- 共享一个控制台：多进程输出会交错
+- 键盘全局共享：多个程序同时轮询时按键随机归属
+- 共享 NovaFS 当前目录；F11 是硬挂起，若进程正卡在磁盘写入的系统调用中会丢弃该操作
+- 最多 4 进程；无优先级，纯轮转
+
+## .nsh 脚本
+
+`nsh.nxp` 内置 **.bat 兼容语法的脚本引擎**。脚本是纯文本文件（内核 NovaSh 用 `write
+名字.nsh` 创建，或预置在 `scripts\` 由 build 注入数据盘），在 nsh 里**直接输入文件名**
+或 `run 名字.nsh` 执行：
+
+```bat
+@echo off                        ← 关闭命令回显（@cmd = 单行不回显）
+rem 这是注释（:: 也可以）
+echo Hello, %who%!               ← set who=world 后用 %who% 引用
+if not %who%==world goto bad     ← 字符串比较（引号可选，比较串内不能有空格）
+:loop                            ← 标签
+echo count = %n%
+if %n%==1 goto end
+goto loop
+pause                            ← 按任意键继续
+exit                             ← 结束脚本（交互态则是退出 nsh）
+```
+
+支持项与限制：变量 8 个（名字 ≤11 字符、值 ≤31 字符，未定义的 `%名%` 保持原样）；
+标签区分大小写（`goto :L` 与 `goto L` 等价）；比较串内不能有空格（两边同样加引号会
+自动抵消）；不支持嵌套脚本、算术 `set /a`、`for` 循环。示例见 `scripts\hello.nsh`
+（变量/pause）与 `scripts\count.nsh`（if/goto 循环倒数）。
+
+另外：在 nsh 里输入**未知的词**会先尝试当作 `.nsh` 脚本执行（batch 习惯），输入
+`名.nxp` 不会自动执行，请用 `run 名.nxp`（那会 spawn 一个新进程）。
 
 ## Ring3 用户态
 
@@ -173,7 +261,7 @@ NovaOS 实现完整的 Ring 0 ↔ Ring 3 切换，所有 `.nxp` 用户程序都�
 内核做了三件事：
 
 1. **Identity Paging + 独立用户页**：页目录（PDE）0–8MB 全带 `US=1` 标志；0x400000–0x500000 范围（syscall trampoline + 用户栈）的 PTE 也设置 US，其余物理内存保持 Supervisor only。
-2. **GDT / TSS / IDT**：GDT 追加 `CS_R3=0x1B`、`DS_R3=0x23`（DPL=3）；TSS 填好 `SS0=0x10 / ESP0`，Ring3 触发中断时 CPU 自动切回内核栈；32 个异常向量 + 0x80 syscall trap gate 全部由 entry.asm 宏生成。
+2. **GDT / TSS / IDT**：GDT 追加 `CS_R3=0x1B`、`DS_R3=0x23`（DPL=3）；TSS 填好 `SS0=0x10 / ESP0`，Ring3 触发中断时 CPU 自动切回内核栈；32 个异常向量 + 0x80 syscall 门 + IRQ0 抢占门（PIC 重映射 + PIT 100Hz）全部由 entry.asm / paging.c 生成。
 3. **Syscall 跳板页（0x00400000）**：用户程序调用 API 时，`call [0x400Fxx]` 跳转到该页的 `int 0x80` stub；内核在进入用户程序前把 syscall stub + API 表拷贝到 trampoline。
 
 Ring3 规则：
@@ -184,13 +272,18 @@ Ring3 规则：
 ## .nxp 程序格式
 
 - **文件**：4 字节魔数 `NXP\x01` + 平坦 32 位保护模式机器码
-- **加载**：固定地址 `0x00300000`（MinGW `ld --image-base 0x00300000` 保证 .data/.bss 不越界），入口 = 加载地址 + 4；独立栈 0x00500000 向下，总大小上限 3 KB
+- **加载**：**每个槽位一个链接基址**（0x300000 / 0x320000 / 0x340000 / 0x360000，
+  见「多进程」；MinGW `ld --image-base <基址>` 保证 .data/.bss 不越界），
+  入口 = 加载地址 + 4；每槽独立栈（0x500000 / 0x4C0000 / 0x480000 / 0x440000 向下），
+  总大小上限 3 KB
 - **Syscall**：通过 trampoline（0x400000）的 `int 0x80` 进行，ABI 与 cdecl 完全一致
 - **入口约定**：`EAX` = 用户可见 API 表指针（0x00400F80，结构体见 kernel.c 的 `nxp_api_t`）：
 
 ```
 +0x00 magic 'NXP1'   +0x04 version=1
 +0x08 putc(c)        +0x0C puts(s)         +0x10 getchar()    +0x14 exit()
+                      ↑ getchar 为**非阻塞**轮询：无键返回 -1（多任务下进程在
+                        自己的时间片里轮询，交互循环写法 `while((c=getchar())<0);`）
 +0x18 scr_w          +0x1C scr_h           （无图形时为 0）
 +0x20 pixel(x,y,rgb) +0x24 fill_rect(x,y,w,h,rgb) +0x28 text(x,y,s,rgb)
 +0x2C getkey()       ← 非阻塞读键：无键返回 -1（交互程序用）
@@ -203,6 +296,10 @@ Ring3 规则：
 +0x3C set_color(fg)   ← 设 VGA 属性前景色，取值见 nxp.h 的 NXP_COLOR_* (0x00–0x0F)
 +0x40 getuser(buf,max) ← 把当前登录用户名拷进 buf，返回长度（Ring3 无需读 /passwd）
 +0x44 getdate(buf,max) ← 把格式化 RTC 日期行 "Date: …  Time: …" 拷进 buf，返回长度
++0x48 readfile(name,buf,max) ← 读 NovaFS 当前目录下的文件进 buf，返回实际大小（-1=错）
++0x4C spawn(name)      ← 把 name.nxp 启动为**新进程**（名.1/2/3.nxp 选槽位），
+                         返回 pid（1–4），-1 = 槽位忙/文件错；调用者继续运行
++0x50 procs(buf,max)   ← 把存活进程列表（每行 "pid 状态 名字"）拷进 buf，返回条数
 ```
 
 方向键扩展码：`NXP_KEY_LEFT/RIGHT/UP/DOWN` = 0x11/0x12/0x13/0x14（nxp.h 有定义）。
@@ -232,28 +329,37 @@ Halted. Power off to restart.
 - 异常名称表含全部 32 个向量（`#DE / #DB / NMI / #BP / #OF / #BR / #UD / #NM / #DF / #TS / #NP / #SS / #GP / #PF / #MF / #AC / #MC / #XM / #VE / #CP …`）
 - 串口同步输出同样内容，调试时直接看 `serial.log` 不用截图
 
-用户态程序崩溃**不会**触发 BSOD，只会打印 `[nxp] user fault: <异常名> eip=… err=… cr2=…` 然后安全返回 shell（`ringbad.nxp` 就是测这个用的）。
+用户态程序崩溃**不会**触发 BSOD：肇事进程被结束（其余进程继续跑，多进程下调度器
+直接切入下一个；一个都不剩则回 shell），并打印 `[nxp] user fault: <异常名> eip=… err=… cr2=…`（`ringbad.nxp` 就是测这个用的）。
 
 - 所有回调为 cdecl；`ret` 或调用 `exit()` 均可安全返回 shell
 - `.nxp` 程序统一由 `programs/nxp_entry.c` 提供入口包装：压参数→调 `nxp_main(argc, argv)`→调 `exit(ret)`
 - `mkdemo` 生成的 demo.nxp 即按此 ABI 手写机器码，可作参考
 
-### 宿主机开发工作流（programs\ 目录）
+### 宿主机开发工作流（programs\ 与 scripts\ 目录）
 
 把 C 源文件放进 `programs\`（如 `hello.c`），运行 `build.ps1` 即自动：
 
-1. 编译链接为 `.nxp`（`nxp_entry.c` 提供入口跳板，链接在最前；`nxp.h` 是 API 头）
-2. 直接写入数据盘模板 `data-seed.img` 的 NovaFS 区域（宿主机生成超级块/inode/位图/数据块）。
-   已存在的 `data.img` 不会被覆盖 —— 改了 `programs\` 里的源码想让 guest 用上新版，
-   删掉 `data.img` 让它重新播种即可（用户数据会一并重置，注意备份）
+1. 编译链接为 `.nxp`（`nxp_entry.c` 提供入口跳板，链接在最前；`nxp.h` 是 API 头），
+   **每个程序按 4 个槽位基址各链接一份**，文件名 `名.nxp` / `名.1.nxp` / `名.2.nxp` /
+   `名.3.nxp`（多进程无需运行时重定位的关键）
+2. 直接写入数据盘模板 `data-seed.img` 的 NovaFS 区域（宿主机生成超级块/inode/位图/数据块）；
+   `scripts\*.nsh` 也会作为纯文本注入根目录
 3. 开机后 `NovaFS mounted`，直接 `run 文件名.nxp` 执行
+
+**重要**：已存在的 `data.img` 不会被覆盖 —— 改了 `programs\` 或 `kernel\` 之后想让
+guest 用上新版，**删掉 `data.img` 让它重新播种**（用户数据会一并重置，注意备份）。
+旧程序配新内核可能出现诡异行为（例如旧版 nsh 配非阻塞 getchar 会刷屏）。
 
 写法参考：
 - `programs/hello.c` — 静态演示，putc/puts 输出
 - `programs/ringok.c`  — **最小 Ring3 健全性测试**：打印 `[user] ring3 alive (ringok)` 然后 `exit(0x42)`；用它验证 Ring3 进入/返回正常
 - `programs/ringbad.c` — **用户态故障测试**：故意 `*(volatile uint32_t*)0x100000 = 1` 写只读内核页，期待触发 "user fault: #PF …" 然后安全回 shell（**不触发 BSOD**）
 - `programs/paint.c` — **交互式画板**：鼠标移动画笔，左键画、右键擦、方向键/WASD 移动、1-8 换色、c 清屏、q 退出（非阻塞 `getkey` + `mouse`）
-- `programs/nsh.c` — **Ring3 子集 shell**：把 NovaSh 的一部分命令抽出来跑在用户态，证明 shell 可脱离内核。从 NovaSh `run nsh.nxp` 进入，提示符 `用户@novaos:nsh#`，支持 `help`/`ver`/`about`/`echo`/`cls`/`whoami`/`date`/`mem`/`exit`；文件系统 / 用户管理 / `run` 仍留在内核 NovaSh，`exit` 回到内核 shell
+- `programs/nsh.c` — **Ring3 子集 shell + .nsh 脚本引擎**：`.bat` 兼容脚本（见「.nsh 脚本」）、
+  方向键行内编辑、`spawn` 拉起新进程、`procs` 看进程表。从 NovaSh `run nsh.nxp` 进入，
+  提示符 `用户@novaos:nsh#`；`exit` 结束脚本/回内核 shell。注意它跑在 Ring3，
+  文件系统 / 用户管理 / `format` 仍在内核 NovaSh
 
 单程序上限 3 KB。注意 MinGW 链接 `.nxp` 必须加 `--image-base 0x00300000 --section-alignment 16`：前者防止 .data/.bss 被 ld 放到 0x400000+ 覆盖 syscall trampoline，后者避免 PE 4K 对齐把程序撑到十几 KB。
 
@@ -293,17 +399,20 @@ typedef struct {
 | VBE LFB             | 0xE0000000    | 内核 R/W   | Bochs VBE 线性帧缓冲（1024×768×32，3 MB） |
 | 内核镜像            | 0x00100000    | 内核 R/X   | kernel.bin 加载地址（identity paging）    |
 | Ring0 栈顶          | 0x00200000    | 内核 R/W   | 向下增长                                  |
-| .nxp 用户程序       | 0x00300000    | Ring3 R/X  | 固定 image base，上限 3 KB                |
+| .nxp 槽0 程序       | 0x00300000    | Ring3 R/X  | 进程槽0；槽1/2/3 = 0x320000/0x340000/0x360000 |
 | Syscall Trampoline  | 0x00400000    | Ring3 R/X  | `int 0x80` stub + 0xF80 起的 API 表       |
-| Ring3 用户栈顶      | 0x00500000    | Ring3 R/W  | 向下增长                                  |
+| 进程栈 槽0–3        | 0x500000 / 0x4C0000 / 0x480000 / 0x440000 | Ring3 R/W | 各自向下增长          |
 | Identity 页目录/表  | 0x001FF000    | 内核 R/W   | 1 PDE + 2 PT（0–8MB，identity map）       |
 
 ## 键盘
 
 - PS/2 scancode set 1
 - `Shift` / `CapsLock` 正常切换大小写
-- 退格键删除上一个字符（限制 128 字符命令行缓冲）
-- 目前不支持 `Tab`、方向键、历史命令
+- **行内编辑**（NovaSh 与 nsh）：`←`/`→` 移动光标，光标中间可插入/删除，
+  右侧内容自动重绘（实现：`putc('\v')` = 光标左移不擦除，编辑后重印尾部再退回）
+- 退格键删除光标前一个字符（限制 128 字符命令行缓冲；单行超出屏幕宽度后编辑不可靠）
+- F11 / F12 为调度器热键（挂起 / 全杀，见「多进程」），普通程序不会收到
+- 目前不支持 `Tab` 补全、`↑↓` 历史命令
 
 ## 鼠标
 
@@ -360,6 +469,42 @@ Welcome, alice. Type 'help' for commands.
 
 alice@novaos:/# whoami
 alice
+```
+
+### 多进程 + .nsh 脚本示例
+
+```
+root@novaos:/# run nsh.nxp
+[proc] started nsh.nxp pid=1  (F11 suspend / F12 kill)
+
+root@novaos:nsh# hello.nsh            ← 直接输文件名 = 运行脚本
+Hello from a .nsh script!
+Hello, world!
+Press a key
+
+root@novaos:nsh# run paint.1.nxp      ← 在槽1 拉起第二个进程
+pid 2
+root@novaos:nsh# procs                ← 两个进程并发（画板可边画边聊）
+1 r nsh.nxp
+2 r paint.1.nxp
+
+（按 F11 —— 全部冻结，回到内核 shell）
+[proc] suspended - 'fg' resumes, 'kill' ends
+root@novaos:/# procs
+pid st name
+1 s nsh.nxp
+2 s paint.1.nxp
+root@novaos:/# fsinfo                 ← 磁盘用量
+NovaFS disk:
+  blocks used : 45 / 32768 (32723 free, 512B each)
+  space used  : 20130 B / 16 MB
+  inodes used : 23 / 256
+  ...
+root@novaos:/# fg                     ← 解冻，回到两个进程
+[proc] resumed
+  （nsh 内）exit → paint 里 q → 全部退出
+[proc] all processes exited
+root@novaos:/#
 ```
 
 注意！在Win7上很有可能出现“已停止运行”，不影响！
