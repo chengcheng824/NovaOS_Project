@@ -178,12 +178,18 @@ int fs_mkdir(const char *name){
     return 0;
 }
 
+/* Prevent the user from deleting the current working directory (or any
+ * ancestor) — otherwise cwdir would point to a free inode. Defined below
+ * rmtree_recursive; forward-declared for fs_rmdir. */
+static int is_ancestor_of_cwd(int dir);
+
 int fs_rmdir(const char *name){
     if(!fs_ready) return -1;
     int idx = fs_find(name);
     if(idx < 0) return -1;
     inode_t *d = &inode_tab[idx];
     if(d->type != T_DIR) return -1;
+    if(is_ancestor_of_cwd(idx)) return -3;  /* safety: can't delete cwd chain */
     /* check empty: scan inodes whose parent == idx */
     for(int i = 1; i < FS_MAX_INODES; i++){
         if(inode_tab[i].type != T_FREE && inode_tab[i].parent == (uint16_t)idx)

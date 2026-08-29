@@ -882,6 +882,12 @@ static int nxp_load_slot(const char *name, int slot)
     return 0;
 }
 
+/* set by cmd_run/cmd_fg around main_checkpoint: distinguishes the first
+ * dive into a process (resume lands after the park and must continue into
+ * jmp_user) from ring3_leave's resume at the same spot (print the outcome
+ * and fall back to the shell prompt) */
+static int g_park_first = 0;
+
 /* shell `run`: spawn, park the shell, and let the scheduler run until
  * every process is gone (or F12 kills them all) */
 static void cmd_run(const char *name)
@@ -894,13 +900,18 @@ static void cmd_run(const char *name)
     kputs("[proc] started "); kputs(name);
     kputs(" pid="); kput_dec((unsigned)pid);
     kputs("  (F11 suspend / F12 kill)\n");
+    g_park_first = 1;                      /* the resume below is the first entry */
     main_checkpoint();                     /* park the shell context */
+    if (!g_park_first) {                   /* scheduler released us */
+        serial_puts("[ret]\n");            /* DIAG: scheduler released us */
+        kputs(proc_any() ? "[proc] suspended - 'fg' resumes, 'kill' ends\n"
+                         : "[proc] all processes exited\n");
+        return;
+    }
+    g_park_first = 0;
     proc_set_current(slot);                /* first tick must save, not roll back */
     serial_puts("[jmp]\n");                /* DIAG: entering the process */
-    jmp_user(proc_frame(slot));            /* in until all exit */
-    serial_puts("[ret]\n");                /* DIAG: scheduler released us */
-    kputs(proc_any() ? "[proc] suspended - 'fg' resumes, 'kill' ends\n"
-                     : "[proc] all processes exited\n");
+    jmp_user(proc_frame(slot));            /* in until all exit (ring3_leave resumes) */
 }
 
 /* shell `procs`: with F11 available, suspended processes are visible here */
@@ -921,10 +932,18 @@ static void cmd_fg(void)
     int slot = proc_next();
     if (slot < 0) { kputs("fg: nothing to run\n"); return; }
     kputs("[proc] resumed\n");
+    g_park_first = 1;
     main_checkpoint();
+    if (!g_park_first) {                   /* scheduler released us */
+        serial_puts("[ret]\n");
+        kputs(proc_any() ? "[proc] suspended - 'fg' resumes, 'kill' ends\n"
+                         : "[proc] all processes exited\n");
+        return;
+    }
+    g_park_first = 0;
     proc_set_current(slot);
-    jmp_user(proc_frame(slot));
-    kputs("[proc] all processes exited\n");
+    serial_puts("[jmp]\n");
+    jmp_user(proc_frame(slot));            /* in until all exit (ring3_leave resumes) */
 }
 
 /* shell `kill [pid]`: end one process, or all of them */
@@ -1060,6 +1079,7 @@ static void cmd_rmdir(const char *name)
     int r = fs_rmdir(name);
     if(r == -1) kputs("rmdir: no such directory\n");
     else if(r == -2) kputs("rmdir: directory not empty\n");
+    else if(r == -3) kputs("rmdir: cannot delete cwd or its ancestor\n");
 }
 
 static void cmd_rd(const char *name)

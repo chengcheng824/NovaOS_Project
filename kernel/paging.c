@@ -438,8 +438,12 @@ void fault_dispatch(regs_t *r, uint32_t vector)   /* exception 0..31, never retu
         /* kill the offender and keep the rest running */
         if (g_cur >= 0) { g_pcb[g_cur].state = PST_FREE; g_cur = -1; }
         int nx = sched_pick();
-        if (nx >= 0) jmp_user(g_pcb[nx].fr);    /* never returns */
-        ring3_leave();                          /* none left: shell */
+        if (nx >= 0) {
+            proc_set_current(nx);              /* first tick must save, not
+                                                * roll the new current back */
+            jmp_user(g_pcb[nx].fr);            /* never returns */
+        }
+        ring3_leave();                         /* none left: shell */
     }
 
     /* kernel fault — show BSOD and halt */

@@ -38,6 +38,8 @@ __start:
 ; ---- Ring 3 enter: cdecl ring3_enter(entry_eip, user_esp, eax_val) ----
 ; saves the kernel context, builds an iret frame, drops to CPL 3.
 _ring3_enter:
+    mov  ecx, [esp]                ; caller's return address = resume point
+    mov  [k3_eip], ecx             ; (same park model as main_checkpoint)
     mov  ecx, [esp+4]              ; user entry eip
     mov  edx, [esp+8]              ; user esp
     mov  eax, [esp+12]             ; value for user EAX (api table)
@@ -90,9 +92,17 @@ _ring3_leave:
     ; SS:ESP pair is updated atomically with respect to interrupts/NMIs.
     mov  ss, dx
     mov  esp, [k3_esp]
+    add  esp, 4                      ; skip the retaddr slot the park saved:
+                                     ; later calls at the same depth reuse it
+                                     ; (e.g. jmp_user's stack argument), so its
+                                     ; content is stale by resume time.
     cld                              ; user code may have left DF set
     sti                              ; every caller arrives via an interrupt
-    ret                              ; gate (IF=0) - the shell needs IF=1
+    jmp  [k3_eip]                    ; gate (IF=0) - the shell needs IF=1.
+                                     ; Deterministic resume at the saved
+                                     ; caller-return address, on the caller's
+                                     ; own stack - never `ret` through the
+                                     ; clobbered slot.
 
 ; ---- int 0x80 syscall gate (DPL 3 trap gate) ----
 _isr_syscall:
@@ -161,6 +171,9 @@ _jmp_user:
 ; The scheduler's ring3_leave() resumes exactly here when the last
 ; process exits. Call at a point where resuming is safe (shell loop).
 _main_checkpoint:
+    mov  eax, [esp]                  ; caller's return address = resume point
+    mov  [k3_eip], eax               ; saved explicitly: the slot itself gets
+                                     ; clobbered by calls after we return
     mov  [k3_ebx], ebx
     mov  [k3_esi], esi
     mov  [k3_edi], edi
@@ -251,6 +264,7 @@ _isr_fault_table:
 section .text
 
 ; kernel context saved while a user program runs
+k3_eip: dd 0
 k3_ebx: dd 0
 k3_esi: dd 0
 k3_edi: dd 0
