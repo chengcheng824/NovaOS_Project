@@ -176,6 +176,10 @@ static void serial_puts(const char *s)
 void kput(char c)   { vga_putc(c);    serial_putc(c); }
 void kputs(const char *s) { vga_puts(s); serial_puts(s); }
 
+/* clear the shared console - the kernel calls this when the LAST process
+ * exits, so the shell always gets a clean screen (paging.c) */
+void kcls(void) { vga_clear(); }
+
 /* ---- Integer helpers ---- */
 void kput_dec(unsigned v)
 {
@@ -747,6 +751,7 @@ typedef struct {
     int  (*listdir)(char *buf, uint32_t max);     /* ls into a buffer   */
     int  (*fsop)(uint32_t op, const char *name);  /* fs ops by opcode   */
     int  (*sysop)(uint32_t op, const char *name); /* system ops by opcode */
+    uint32_t (*ticks)(void);                      /* 10 ms since boot   */
 } nxp_api_t;
 
 static void nxp_api_putc(char c)              { kput(c); }
@@ -818,6 +823,9 @@ static int nxp_api_writefile(const char *name, const uint8_t *data, uint32_t len
     if (!name || !data || !len) return -1;
     return fs_write(name, data, len);
 }
+
+/* 10 ms since boot - the clock games and animation are built on */
+static uint32_t nxp_api_ticks(void) { return proc_ticks(); }
 
 /* ---- the syscall layer reuses the shell command implementations ---- */
 static void cmd_mkdir(const char *name);
@@ -926,7 +934,7 @@ static nxp_api_t nxp_api = {
     nxp_api_getpixel,
     nxp_api_cls, nxp_api_setcolor, nxp_api_getuser, nxp_api_getdate,
     nxp_api_readfile, nxp_api_spawn, nxp_api_procs, nxp_api_writefile,
-    nxp_api_listdir, nxp_api_fsop, nxp_api_sysop
+    nxp_api_listdir, nxp_api_fsop, nxp_api_sysop, nxp_api_ticks
 };
 
 /* "name.D.nxp" selects process slot D (0-3); plain "name.nxp" = slot 0 */

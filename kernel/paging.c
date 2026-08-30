@@ -27,6 +27,8 @@ extern void jmp_user(uint32_t *fr);  /* iret into a saved user frame  */
 extern int kb_take_raw(uint8_t raw);
 /* kernel.c: F11/F12 seen by a process's own keyboard poll (0 = none) */
 extern int kb_take_hotkey(void);
+/* kernel.c: clear the shared console (last process exited) */
+extern void kcls(void);
 
 static inline void outb(uint16_t port, uint8_t v)
 {
@@ -56,6 +58,7 @@ typedef struct {
     fn5 pixel, fill_rect, text, getkey, mouse, get_pixel;
     fn5 cls, set_color, getuser, getdate, readfile, spawn, procs, writefile;
     fn5 listdir, fsop, sysop;
+    fn5 ticks;
 } kapi_t;
 static const kapi_t *g_api;
 
@@ -70,7 +73,7 @@ enum { SYS_PUTC, SYS_PUTS, SYS_GETCHAR, SYS_EXIT,
        SYS_MOUSE, SYS_GETPIXEL,
        SYS_CLS, SYS_SETCOLOR, SYS_GETUSER, SYS_GETDATE, SYS_READFILE,
        SYS_SPAWN, SYS_PROCS, SYS_WRITEFILE,
-       SYS_LISTDIR, SYS_FSOP, SYS_SYSOP, SYS_COUNT };
+       SYS_LISTDIR, SYS_FSOP, SYS_SYSOP, SYS_TICKS, SYS_COUNT };
 
 /* ============================================================
  * Processes: 4 fixed slots, ONE address space (no CR3 switch).
@@ -97,8 +100,11 @@ typedef struct {
 static pcb_t g_pcb[NSLOT];
 static int  g_cur  = -1;                /* pcb interrupted/running */
 static int  g_last = -1;                /* last scheduled, for RR  */
+static volatile uint32_t g_ticks;       /* 10 ms since boot (IRQ0) */
 
 uint32_t proc_slot_base(int slot) { return slot_base[slot]; }
+
+uint32_t proc_ticks(void) { return g_ticks; }   /* 10 ms units */
 
 int proc_spawn(int slot, const char *name)
 {
@@ -207,6 +213,7 @@ static void proc_stop_all(void)
 void irq0_dispatch(uint32_t *f)
 {
     outb(0x20, 0x20);                   /* EOI first: we may not iret */
+    g_ticks++;                          /* the 10 ms wall clock */
     if ((f[9] & 3) != 3) return;        /* interrupted the kernel: skip -
                                          * hotkeys stay queued for next tick */
     if (g_cur >= 0) {                   /* snapshot current before anything */
@@ -215,10 +222,12 @@ void irq0_dispatch(uint32_t *f)
     }
     if (kb_take_raw(0x57) && proc_any()) {      /* F11: freeze all */
         proc_stop_all();
-        ring3_leave();                  /* back to the shell */
+        kcls();                         /* hand the shell a clean screen */
+        ring3_leave();
     }
     if (kb_take_raw(0x58) && proc_any()) {      /* F12: kill all */
         proc_kill_all();
+        kcls();
         ring3_leave();
     }
     int nx = sched_pick();
@@ -273,7 +282,7 @@ void syscall_dispatch(regs_t *r)
         g_cur = -1;
         if (saved_cwd >= 0) fs_setcwd(saved_cwd);
         int nx = sched_pick();
-        if (nx < 0) ring3_leave();      /* none left: back to the shell */
+        if (nx < 0) { kcls(); ring3_leave(); }   /* none left: clean shell */
         for (int i = 0; i < NSAVE; i++) r->r[i] = g_pcb[nx].fr[i];
         g_cur = nx;
         g_last = nx;
@@ -293,6 +302,8 @@ void syscall_dispatch(regs_t *r)
     }
     case SYS_SYSOP:
         ret = g_api->sysop(a[0], uptr(a[1]), 0, 0, 0); break;
+    case SYS_TICKS:
+        ret = g_api->ticks(0, 0, 0, 0, 0); break;
     case SYS_PIXEL:    g_api->pixel(a[0], a[1], a[2], 0, 0); break;
     case SYS_FILL:     g_api->fill_rect(a[0], a[1], a[2], a[3], a[4]); break;
     case SYS_TEXT:     g_api->text(a[0], a[1], uptr(a[2]), a[3], 0); break;
@@ -317,10 +328,12 @@ void syscall_dispatch(regs_t *r)
     if (hk == 0x57 && g_cur >= 0) {     /* F11: freeze all, back to shell */
         for (int i = 0; i < NSAVE; i++) g_pcb[g_cur].fr[i] = r->r[i];
         proc_stop_all();                /* everything STOPPED (cur included) */
+        kcls();
         ring3_leave();                  /* never returns */
     }
     if (hk == 0x58 && g_cur >= 0) {     /* F12: kill all, back to shell */
         proc_kill_all();
+        kcls();
         ring3_leave();                  /* never returns */
     }
     r->r[7] = ret;                              /* return value -> EAX */
@@ -460,7 +473,8 @@ void fault_dispatch(regs_t *r, uint32_t vector)   /* exception 0..31, never retu
                                                 * roll the new current back */
             jmp_user(g_pcb[nx].fr);            /* never returns */
         }
-        ring3_leave();                         /* none left: shell */
+        kcls();                                /* none left: clean shell */
+        ring3_leave();
     }
 
     /* kernel fault — show BSOD and halt */
@@ -493,7 +507,7 @@ static uint8_t *emit_stub(uint8_t *p, uint32_t sysno, int nargs)
 
 void ring3_setup_tramp(void)
 {
-    static const uint8_t nargs[SYS_COUNT] = { 1,1,0,0,3,5,4,0,3,2, 0,1,2,2,3,1,2,3, 2,2,2 };
+    static const uint8_t nargs[SYS_COUNT] = { 1,1,0,0,3,5,4,0,3,2, 0,1,2,2,3,1,2,3, 2,2,2,0 };
     uint8_t *p = (uint8_t *)NXP_TRAMP_BASE;
     uint32_t stub[SYS_COUNT];
 
@@ -517,7 +531,7 @@ void ring3_setup_tramp(void)
     t[18] = stub[SYS_READFILE]; t[19] = stub[SYS_SPAWN];
     t[20] = stub[SYS_PROCS];   t[21] = stub[SYS_WRITEFILE];
     t[22] = stub[SYS_LISTDIR]; t[23] = stub[SYS_FSOP];
-    t[24] = stub[SYS_SYSOP];
+    t[24] = stub[SYS_SYSOP];   t[25] = stub[SYS_TICKS];
 }
 
 /* ---- descriptor helpers ---- */

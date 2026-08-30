@@ -318,6 +318,8 @@ Ring3 规则：
 +0x54 writefile(name,data,len) ← 新建/覆盖 NovaFS 文件（属主检查生效），
                          返回写入长度，-1 = 错误/权限不足。配合 readfile，
                          用户程序第一次拥有了完整的文件读写能力
++0x58 ticks()          ← 系统启动以来的 10 ms 计数（IRQ0 累加），
+                         游戏节拍/动画定时的基准时钟
 ```
 
 方向键扩展码：`NXP_KEY_LEFT/RIGHT/UP/DOWN` = 0x11/0x12/0x13/0x14（nxp.h 有定义）。
@@ -374,6 +376,7 @@ guest 用上新版，**删掉 `data.img` 让它重新播种**（用户数据会�
 - `programs/ringok.c`  — **最小 Ring3 健全性测试**：打印 `[user] ring3 alive (ringok)` 然后 `exit(0x42)`；用它验证 Ring3 进入/返回正常
 - `programs/ringbad.c` — **用户态故障测试**：故意 `*(volatile uint32_t*)0x100000 = 1` 写只读内核页，期待触发 "user fault: #PF …" 然后安全回 shell（**不触发 BSOD**）
 - `programs/paint.c` — **交互式画板**：鼠标移动画笔，左键画、右键擦、方向键/WASD 移动、1-8 换色、c 清屏、q 退出（非阻塞 `getkey` + `mouse`）
+- `programs/snake.c` — **贪吃蛇**：方向键/WASD 转向，吃红色食物变长加速，撞墙/咬到自己结束；SPACE 重开、ESC/q 回 shell。节拍来自 `ticks()` 系统调用（IRQ0 的 10ms 计数），任何宿主机速度一致；和 paint 同时 `run` 可以真的边聊天边玩
 - `programs/nsh.c` — **完整 NovaSh 移植版（Ring3）**：内核 shell 的全部命令
   （ls/cd/mkdir/write/cat/rm/format/fsinfo/useradd/su/passwd/acpi/reboot/shutdown…）
   通过 `listdir`/`fsop`/`sysop` 三个系统调用复用内核实现，文件属主与进程 cwd 规则

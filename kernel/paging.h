@@ -41,6 +41,7 @@ void proc_kill_all(void);                      /* free every slot          */
 int  proc_kill(int pid);                       /* free one pid, -1 = bad   */
 int  proc_next(void);                          /* next schedulable, -1     */
 void proc_set_current(int slot);               /* mark slot as the running */
+uint32_t proc_ticks(void);                     /* 10 ms since boot         */
 
 /* address of the exit stub inside the trampoline page              */
 extern uint32_t g_nxp_exit_stub;

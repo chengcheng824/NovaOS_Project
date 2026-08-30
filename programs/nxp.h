@@ -51,6 +51,7 @@ typedef struct {
                                          /* 1=useradd 2=userdel 3=passwd
                                           * 4=su 5=mkdemo 6=acpi 7=reboot
                                           * 8=shutdown 9=halt 10=fg 11=kill  */
+    u32  (*ticks)(void);                 /* 10 ms since boot (game timing)   */
 } nxp_api_t;
 
 /* set_color() foreground values (VGA attribute low nibble) */
