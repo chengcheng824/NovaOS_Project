@@ -1,6 +1,6 @@
 # NovaOS
 
-一个简洁的 32 位 C 语言操作系统内核，带 **多用户登录**（开机认证 + 密码哈希持久化）、**Ring3 用户态**（分页 + TSS + IDT + int 0x80 syscall）、**抢占式多进程**（PIT 100Hz + Ring3-only 抢占 + 4 进程槽）、**.nsh 批处理脚本**（.bat 兼容语法）、交互式 shell `NovaSh`（方向键行内编辑）、**NovaFS**（256 inode / 多级目录 / 递归删除）、**运行时 ACPI/AML 解析关机**、**Bochs VBE 图形驱动（1024x768x32 真彩控制台）**、**Windows BSOD 风格红屏崩溃页** 与美化启动画面，可用 QEMU 直接启动测试。（建议使用 QEMU 6.2，支持最好）
+一个简洁的 32 位 C 语言操作系统内核，带 **多用户登录**（开机认证 + 密码哈希 + 文件属主权限）、**Ring3 用户态**（分页 + TSS + IDT + int 0x80 syscall）、**抢占式多进程**（PIT 100Hz + Ring3-only 抢占 + 4 进程槽）、**.nsh 批处理脚本**（.bat 兼容语法，内核/Ring3 双引擎）、交互式 shell `NovaSh`（方向键行内编辑）、**NovaFS**（256 inode / 多级目录 / 间接块 67KB 文件 / 递归删除 / 磁盘用量统计）、**运行时 ACPI/AML 解析关机**、**Bochs VBE 图形驱动（1024x768x32 真彩控制台）**、**贪吃蛇**（第一个原生游戏）、**Windows BSOD 风格红屏崩溃页** 与美化启动画面，可用 QEMU 直接启动测试。（建议使用 QEMU 6.2，支持最好）
 
 ## 目录结构
 
@@ -21,11 +21,12 @@ NovaOS/
 │   ├── stdint.h            # 最小 stdint
 │   └── link.ld             # 链接脚本 (段紧凑于 0x100000)
 ├── programs/               # Ring3 用户程序源码 (build 自动编译注入)
-│   ├── nxp.h / nxp_entry.c # .nxp API 头 (21 项) + 入口跳板
+│   ├── nxp.h / nxp_entry.c # .nxp API 头 (26 项) + 入口跳板
 │   ├── hello.c             # 静态演示 (彩条)
 │   ├── ringok.c / ringbad.c  # Ring3 健全性 / 用户态故障测试
 │   ├── paint.c             # 鼠标画板
-│   └── nsh.c               # nsh.nxp: 子集 shell + .nsh 脚本引擎
+│   ├── snake.c             # 贪吃蛇 (第一个原生游戏)
+│   └── nsh.c               # nsh.nxp: 完整 NovaSh + .nsh 脚本引擎
 ├── scripts/                # .nsh 示例脚本 (build 注入 data-seed.img)
 │   ├── hello.nsh           # 第一个脚本：变量 / 回显 / pause
 │   └── count.nsh           # if/goto 循环倒数 3-2-1
@@ -158,7 +159,7 @@ Welcome, root. Type 'help' for commands.
 | `halt`     | CLI 停机                             |
 | `fsinfo`   | NovaFS **磁盘用量**（已用/空闲块、已用字节、inode）+ 当前目录条目数 |
 | `format`   | 强制重新格式化 NovaFS                 |
-| `run  名`  | 启动 .nxp 为进程并挂起 shell（见「多进程」） |
+| `run  名`  | `名.nsh` = 运行脚本；`名.nxp` = 启动进程并挂起 shell（见「多进程」） |
 | `procs`    | 列出进程（`ps` 同义）；`s`=挂起 `r`=就绪 |
 | `fg`       | 恢复全部挂起的进程                    |
 | `kill N`   | 结束进程 N（不带 N = 结束全部）       |
@@ -233,8 +234,9 @@ root@novaos:/# （F12 = 不挂起直接全杀回 shell）
   （32KB）和 trampoline 页 —— 虽是共享地址空间，进程 A 再也改写不了进程 B 的内存
 - **独立当前目录**：每个进程有自己的 NovaFS cwd（spawn 时继承），系统调用期间
   内核自动切换并在返回前恢复；目录被其它进程删掉则自动回落到根
-- 仍共享：控制台（输出交错）、键盘（轮询者各自抓键）、用户身份（所有进程都以
-  当前登录用户的 uid 执行）
+- **控制台自动清屏**：最后一个进程退出/被杀（含 F11/F12）时内核自动清屏，
+  shell 总是拿到干净的画面；还有别的进程存活时不清（保护同伴的画面）
+- 仍共享：键盘（轮询者各自抓键）、用户身份（所有进程都以当前登录用户的 uid 执行）
 - F11 是硬挂起，若进程正卡在磁盘写入的系统调用中会丢弃该操作
 - 最多 4 进程；无优先级，纯轮转；无 fork / IPC
 
@@ -516,9 +518,12 @@ Press a key
 
 root@novaos:nsh# run paint.1.nxp      ← 在槽1 拉起第二个进程
 pid 2
-root@novaos:nsh# procs                ← 两个进程并发（画板可边画边聊）
+root@novaos:nsh# run snake.2.nxp      ← 槽2 再来一条蛇，三个进程并发
+pid 3
+root@novaos:nsh# procs                ← 画板、贪吃蛇和 shell 同屏轮转
 1 r nsh.nxp
 2 r paint.1.nxp
+3 r snake.2.nxp
 
 （按 F11 —— 全部冻结，回到内核 shell）
 [proc] suspended - 'fg' resumes, 'kill' ends
