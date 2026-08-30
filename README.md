@@ -116,7 +116,12 @@ Welcome, root. Type 'help' for commands.
 - **特权分离**：仅 root 可 `useradd` / `userdel` / `format`；`su` 时 root 切换免密、普通用户要输目标密码
 - 改动会立即经 ATA 写回数据盘，重启、重新编译都不丢；`format`（仅 root）会清空账户（root/nova 仍可登录）
 - 用户名上限 23 字符（NovaFS 文件名限制）；密码上限 31 字符、不允许空密码
-- `logout` 回到登录界面可换账户登录；文件级 rwx 权限位尚未实现
+- `logout` 回到登录界面可换账户登录
+- **文件属主**：每个文件/目录记录创建者的数字 uid（存于 inode 的 `pad[0]` 字节，root=0；
+  uid 由用户名哈希导出，旧数据盘上的文件 pad[0]=0 天然归 root）。非 root 用户
+  **不能覆盖/删除别人创建**的文件和目录（`rm`/`rmdir`/`rd`/`write` 会得到
+  permission denied）；`/passwd` 豁免 —— 改密码走内核的旧密码验证流程
+- 读权限暂不设限（任何用户可读所有文件）；rwx 三位权限组尚未实现
 - 登录提示与输入同时回显到串口，方便无显示调试
 
 ## NovaSh 命令
@@ -133,7 +138,8 @@ Welcome, root. Type 'help' for commands.
 | `logout`      | 注销，返回登录界面                          |
 
 特权模型：只有 **root** 能执行 `useradd` / `userdel` / `format`，
-其他用户执行会得到 `permission denied`；文件级权限位暂未实现，所有用户仍能读写全部文件。
+其他用户执行会得到 `permission denied`；文件**写入/删除**按属主检查（见「登录与多用户」），
+读暂不设限，rwx 三位权限组尚未实现。
 
 ### 通用
 
@@ -178,7 +184,7 @@ Shell prompt 显示 当前用户 和当前工作目录：`root@novaos:/docs/sub#
 | `rm  名`     | 删除文件（目录请用 `rmdir` / `rd`）                      |
 | `mkdemo`     | 生成示例程序 demo.nxp（然后 `run demo.nxp`）             |
 
-注：单个文件大小上限 6 块 = 3072 B（直接块 NDIRECT=6）。
+注：单个文件大小上限 = 6 直接块 + 1 间接块（128 项）= **68608 B**；3072 B 以内只用直接块（旧版完全兼容）。
 
 ## 多进程
 
@@ -221,18 +227,27 @@ root@novaos:/# （F12 = 不挂起直接全杀回 shell）
 - 用户程序崩溃只死它自己，其余进程继续跑；`fg` 从保存的寄存器帧精确恢复
 - `getchar()` 已改为**非阻塞**（无键返回 -1），交互程序在自己的时间片里轮询
 
-### 已知限制（v1 设计取舍）
+### 进程隔离与已知限制
 
-- 共享一个控制台：多进程输出会交错
-- 键盘全局共享：多个程序同时轮询时按键随机归属
-- 共享 NovaFS 当前目录；F11 是硬挂起，若进程正卡在磁盘写入的系统调用中会丢弃该操作
-- 最多 4 进程；无优先级，纯轮转
+- **内存隔离**：系统调用只能访问调用者自己槽位的镜像（+BSS）、自己的栈窗
+  （32KB）和 trampoline 页 —— 虽是共享地址空间，进程 A 再也改写不了进程 B 的内存
+- **独立当前目录**：每个进程有自己的 NovaFS cwd（spawn 时继承），系统调用期间
+  内核自动切换并在返回前恢复；目录被其它进程删掉则自动回落到根
+- 仍共享：控制台（输出交错）、键盘（轮询者各自抓键）、用户身份（所有进程都以
+  当前登录用户的 uid 执行）
+- F11 是硬挂起，若进程正卡在磁盘写入的系统调用中会丢弃该操作
+- 最多 4 进程；无优先级，纯轮转；无 fork / IPC
 
 ## .nsh 脚本
 
 `nsh.nxp` 内置 **.bat 兼容语法的脚本引擎**。脚本是纯文本文件（内核 NovaSh 用 `write
 名字.nsh` 创建，或预置在 `scripts\` 由 build 注入数据盘），在 nsh 里**直接输入文件名**
-或 `run 名字.nsh` 执行：
+或 `run 名字.nsh` 执行。
+
+**内核 NovaSh 也能直接跑 .nsh 脚本**（`run 名字.nsh`，无需进入 nsh.nxp）—— 内核侧
+引擎把脚本里的未知命令委托给 shell 命令分发器，因此脚本可以使用**全部 NovaSh 命令**
+（`mkdir` / `write` / `useradd` / `ls` / `run` …），适合系统管理类脚本；两处引擎语法
+保持一致。脚本里 `run X.nxp` 会挂起 shell 进入多任务，全部进程退出后脚本继续往下走。
 
 ```bat
 @echo off                        ← 关闭命令回显（@cmd = 单行不回显）
@@ -275,7 +290,7 @@ Ring3 规则：
 - **加载**：**每个槽位一个链接基址**（0x300000 / 0x320000 / 0x340000 / 0x360000，
   见「多进程」；MinGW `ld --image-base <基址>` 保证 .data/.bss 不越界），
   入口 = 加载地址 + 4；每槽独立栈（0x500000 / 0x4C0000 / 0x480000 / 0x440000 向下），
-  总大小上限 3 KB
+  程序上限 68608 B（间接块），槽内 BSS 可用至 ~124 KB
 - **Syscall**：通过 trampoline（0x400000）的 `int 0x80` 进行，ABI 与 cdecl 完全一致
 - **入口约定**：`EAX` = 用户可见 API 表指针（0x00400F80，结构体见 kernel.c 的 `nxp_api_t`）：
 
@@ -300,6 +315,9 @@ Ring3 规则：
 +0x4C spawn(name)      ← 把 name.nxp 启动为**新进程**（名.1/2/3.nxp 选槽位），
                          返回 pid（1–4），-1 = 槽位忙/文件错；调用者继续运行
 +0x50 procs(buf,max)   ← 把存活进程列表（每行 "pid 状态 名字"）拷进 buf，返回条数
++0x54 writefile(name,data,len) ← 新建/覆盖 NovaFS 文件（属主检查生效），
+                         返回写入长度，-1 = 错误/权限不足。配合 readfile，
+                         用户程序第一次拥有了完整的文件读写能力
 ```
 
 方向键扩展码：`NXP_KEY_LEFT/RIGHT/UP/DOWN` = 0x11/0x12/0x13/0x14（nxp.h 有定义）。
@@ -356,12 +374,18 @@ guest 用上新版，**删掉 `data.img` 让它重新播种**（用户数据会�
 - `programs/ringok.c`  — **最小 Ring3 健全性测试**：打印 `[user] ring3 alive (ringok)` 然后 `exit(0x42)`；用它验证 Ring3 进入/返回正常
 - `programs/ringbad.c` — **用户态故障测试**：故意 `*(volatile uint32_t*)0x100000 = 1` 写只读内核页，期待触发 "user fault: #PF …" 然后安全回 shell（**不触发 BSOD**）
 - `programs/paint.c` — **交互式画板**：鼠标移动画笔，左键画、右键擦、方向键/WASD 移动、1-8 换色、c 清屏、q 退出（非阻塞 `getkey` + `mouse`）
-- `programs/nsh.c` — **Ring3 子集 shell + .nsh 脚本引擎**：`.bat` 兼容脚本（见「.nsh 脚本」）、
-  方向键行内编辑、`spawn` 拉起新进程、`procs` 看进程表。从 NovaSh `run nsh.nxp` 进入，
-  提示符 `用户@novaos:nsh#`；`exit` 结束脚本/回内核 shell。注意它跑在 Ring3，
-  文件系统 / 用户管理 / `format` 仍在内核 NovaSh
+- `programs/nsh.c` — **完整 NovaSh 移植版（Ring3）**：内核 shell 的全部命令
+  （ls/cd/mkdir/write/cat/rm/format/fsinfo/useradd/su/passwd/acpi/reboot/shutdown…）
+  通过 `listdir`/`fsop`/`sysop` 三个系统调用复用内核实现，文件属主与进程 cwd 规则
+  与内核完全一致；再加上 `.bat` 兼容的 .nsh 脚本引擎、方向键行内编辑、
+  `spawn` 多进程、`procs`/`fg`/`kill`。从 NovaSh `run nsh.nxp` 进入，
+  提示符 `用户@novaos:nsh#`，`exit`/`logout` 回内核 shell
 
-单程序上限 3 KB。注意 MinGW 链接 `.nxp` 必须加 `--image-base 0x00300000 --section-alignment 16`：前者防止 .data/.bss 被 ld 放到 0x400000+ 覆盖 syscall trampoline，后者避免 PE 4K 对齐把程序撑到十几 KB。
+单程序上限 68608 B（6 直接块 + 间接块）。注意 MinGW 链接 `.nxp` 必须加
+`--image-base <槽位基址> --section-alignment 16`：前者防止 .data/.bss 被 ld 放到
+0x400000+ 覆盖 syscall trampoline，后者避免 PE 4K 对齐把程序撑到十几 KB。
+超过 3072 B 的部分经 inode `pad[0..3]` 指向的**间接块**（128 个块号）寻址，
+`build.ps1` 与内核的读写/释放路径均已实现。
 
 ## NovaFS 设计
 
@@ -385,6 +409,11 @@ typedef struct {
 ```
 
 - 数据块 512 B / 块，位图 8 sectors = 32768 bits，支持最多 32768 块
+- **单间接块**：inode `pad[0..3]` 复用为间接块号（128 个块指针/块），
+  文件上限 = 6 直接块 + 128 间接块 = 68608 B；pad 历史上恒为 0，旧盘向后兼容
+- inode 的 `pad[0]` 在引入间接块**之前**曾是属主 uid —— 现属主 uid 移到 `flags` 字节
+  （0 = root），登录/`su` 时内核调 `fs_setuid()` 切换当前身份，新建的文件/目录打上
+  创建者的 uid；非 root 对他人对象的写入/删除操作返回权限错误（`/passwd` 豁免）
 - 每次 inode / bitmap 变动都通过 ATA PIO `ata_write()` 写回磁盘，**持久化**
 - 账户库 `/passwd` 就是根目录下的普通文件（多行 `用户名:哈希`），随 NovaFS 持久化
 

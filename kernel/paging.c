@@ -8,6 +8,7 @@
  * ============================================================ */
 #include "paging.h"
 #include "gfx.h"
+#include "novafs.h"
 
 /* console helpers from kernel.c (non-static there) */
 extern void kput(char c);
@@ -31,20 +32,6 @@ static inline void outb(uint16_t port, uint8_t v)
 {
     __asm__ volatile ("outb %0, %1" : : "a"(v), "Nd"(port));
 }
-static inline uint8_t inb(uint16_t port)
-{
-    uint8_t v;
-    __asm__ volatile ("inb %1, %0" : "=a"(v) : "Nd"(port));
-    return v;
-}
-
-/* COM1 trace for the scheduler (serial.log diagnostics) */
-static void ser(char c)
-{
-    int t = 100000;
-    while (!(inb(0x3F8 + 5) & 0x20) && --t) ;
-    outb(0x3F8, (uint8_t)c);
-}
 
 /* ---- fixed placements (linker gives only 16-byte alignment) ---- */
 #define PDE_ADDR          0x00141000u
@@ -67,7 +54,8 @@ typedef struct {
     fn5 putc, puts, getchar, exit;
     uint32_t scr_w, scr_h;
     fn5 pixel, fill_rect, text, getkey, mouse, get_pixel;
-    fn5 cls, set_color, getuser, getdate, readfile, spawn, procs;
+    fn5 cls, set_color, getuser, getdate, readfile, spawn, procs, writefile;
+    fn5 listdir, fsop, sysop;
 } kapi_t;
 static const kapi_t *g_api;
 
@@ -81,7 +69,8 @@ enum { SYS_PUTC, SYS_PUTS, SYS_GETCHAR, SYS_EXIT,
        SYS_PIXEL, SYS_FILL, SYS_TEXT, SYS_GETKEY,
        SYS_MOUSE, SYS_GETPIXEL,
        SYS_CLS, SYS_SETCOLOR, SYS_GETUSER, SYS_GETDATE, SYS_READFILE,
-       SYS_SPAWN, SYS_PROCS, SYS_COUNT };
+       SYS_SPAWN, SYS_PROCS, SYS_WRITEFILE,
+       SYS_LISTDIR, SYS_FSOP, SYS_SYSOP, SYS_COUNT };
 
 /* ============================================================
  * Processes: 4 fixed slots, ONE address space (no CR3 switch).
@@ -103,11 +92,11 @@ typedef struct {
     uint32_t state;                     /* PST_*                  */
     uint32_t fr[NSAVE];                 /* saved iret frame       */
     char     name[13];                  /* program file name      */
+    uint32_t cwd;                       /* per-process NovaFS cwd */
 } pcb_t;
 static pcb_t g_pcb[NSLOT];
 static int  g_cur  = -1;                /* pcb interrupted/running */
 static int  g_last = -1;                /* last scheduled, for RR  */
-static uint32_t g_tik;                  /* DIAG: tick counter */
 
 uint32_t proc_slot_base(int slot) { return slot_base[slot]; }
 
@@ -123,6 +112,7 @@ int proc_spawn(int slot, const char *name)
     *(uint32_t *)(slot_stack[slot] - 4) = g_nxp_exit_stub;
     p->fr[11] = slot_stack[slot] - 4;   /* esp: `ret` hits the exit stub */
     p->fr[12] = 0x23;                   /* user ss               */
+    p->cwd = (uint32_t)fs_cwd();        /* inherit spawner's directory */
     p->state = PST_READY;
     int i = 0;
     while (name && name[i] && i < 12) { p->name[i] = name[i]; i++; }
@@ -217,7 +207,6 @@ static void proc_stop_all(void)
 void irq0_dispatch(uint32_t *f)
 {
     outb(0x20, 0x20);                   /* EOI first: we may not iret */
-    if (!(++g_tik & 0xFF)) ser('t');    /* DIAG: timer heartbeat ~2.6s */
     if ((f[9] & 3) != 3) return;        /* interrupted the kernel: skip -
                                          * hotkeys stay queued for next tick */
     if (g_cur >= 0) {                   /* snapshot current before anything */
@@ -234,11 +223,9 @@ void irq0_dispatch(uint32_t *f)
     }
     int nx = sched_pick();
     if (nx < 0) return;                 /* alone: keep running */
-    int prev = g_cur;
     for (int i = 0; i < NSAVE; i++) f[i] = g_pcb[nx].fr[i];
     g_cur = nx;
     g_last = nx;
-    if (nx != prev) ser('S');           /* DIAG: an actual task change */
 }
 
 uint32_t g_nxp_exit_stub;
@@ -246,12 +233,19 @@ uint32_t g_nxp_exit_stub;
 /* runtime stub addresses, for fault diagnostics */
 static uint32_t g_stub_addr[SYS_COUNT];
 
-/* ---- accept only user-space pointers from user programs ---- */
+/* ---- accept only pointers inside the CALLING process's memory ----
+ * The address space is shared, so this check IS the process isolation:
+ * a syscall may touch its own slot image (+BSS), its own stack window,
+ * or the shared trampoline page - never another process's memory. */
 static uint32_t uptr(uint32_t p)
 {
-    /* user-mapped RAM ends at 0x501000: ptl covers 3MB..4MB, ptu covers
-     * 4MB..5MB+4K (i <= 0x100). Pointers above that are supervisor-only. */
-    return (p >= 0x00300000u && p < 0x00501000u) ? p : 0;
+    if (p >= NXP_TRAMP_BASE && p < NXP_TRAMP_BASE + 0x1000u) return p;
+    if (g_cur < 0) return 0;
+    uint32_t b = slot_base[g_cur];
+    if (p >= b && p < b + 0x2000u) return p;            /* image + BSS  */
+    uint32_t t = slot_stack[g_cur];
+    if (p >= t - 0x8000u && p < t) return p;            /* stack window */
+    return 0;
 }
 
 void syscall_dispatch(regs_t *r)
@@ -261,6 +255,14 @@ void syscall_dispatch(regs_t *r)
     uint32_t *a = (uint32_t *)uptr(r->r[4]);   /* EBX = args block */
     if (!a) { r->r[7] = 0; return; }
 
+    /* per-process cwd: every fs-touching syscall runs against the
+     * caller's own directory, restored before returning */
+    int saved_cwd = -1;
+    if (g_cur >= 0) {
+        saved_cwd = fs_cwd();
+        fs_setcwd((int)g_pcb[g_cur].cwd);
+    }
+
     switch (r->r[7]) {
     case SYS_PUTC:     g_api->putc(a[0], 0, 0, 0, 0); break;
     case SYS_PUTS:     g_api->puts(uptr(a[0]), 0, 0, 0, 0); break;
@@ -269,6 +271,7 @@ void syscall_dispatch(regs_t *r)
         /* process death: reuse this very frame for the next process */
         if (g_cur >= 0) g_pcb[g_cur].state = PST_FREE;
         g_cur = -1;
+        if (saved_cwd >= 0) fs_setcwd(saved_cwd);
         int nx = sched_pick();
         if (nx < 0) ring3_leave();      /* none left: back to the shell */
         for (int i = 0; i < NSAVE; i++) r->r[i] = g_pcb[nx].fr[i];
@@ -278,6 +281,18 @@ void syscall_dispatch(regs_t *r)
     }
     case SYS_SPAWN:    ret = g_api->spawn(uptr(a[0]), 0, 0, 0, 0); break;
     case SYS_PROCS:    ret = g_api->procs(uptr(a[0]), a[1], 0, 0, 0); break;
+    case SYS_WRITEFILE:
+        ret = g_api->writefile(uptr(a[0]), uptr(a[1]), a[2], 0, 0); break;
+    case SYS_LISTDIR:
+        ret = g_api->listdir(uptr(a[0]), a[1], 0, 0, 0); break;
+    case SYS_FSOP: {
+        ret = g_api->fsop(a[0], uptr(a[1]), 0, 0, 0);
+        /* op 5 = cd: make the new directory stick to this process */
+        if (a[0] == 5 && ret == 0 && g_cur >= 0) g_pcb[g_cur].cwd = fs_cwd();
+        break;
+    }
+    case SYS_SYSOP:
+        ret = g_api->sysop(a[0], uptr(a[1]), 0, 0, 0); break;
     case SYS_PIXEL:    g_api->pixel(a[0], a[1], a[2], 0, 0); break;
     case SYS_FILL:     g_api->fill_rect(a[0], a[1], a[2], a[3], a[4]); break;
     case SYS_TEXT:     g_api->text(a[0], a[1], uptr(a[2]), a[3], 0); break;
@@ -292,6 +307,8 @@ void syscall_dispatch(regs_t *r)
     case SYS_GETDATE:  ret = g_api->getdate(uptr(a[0]), a[1], 0, 0, 0); break;
     case SYS_READFILE: ret = g_api->readfile(uptr(a[0]), uptr(a[1]), a[2], 0, 0); break;
     }
+
+    if (saved_cwd >= 0) fs_setcwd(saved_cwd);   /* back to the shell's cwd */
 
     /* F11/F12 pressed while a process was polling the keyboard: the
      * process consumed the raw scancode before any tick could see it,
@@ -476,7 +493,7 @@ static uint8_t *emit_stub(uint8_t *p, uint32_t sysno, int nargs)
 
 void ring3_setup_tramp(void)
 {
-    static const uint8_t nargs[SYS_COUNT] = { 1,1,0,0,3,5,4,0,3,2, 0,1,2,2,3,1,2 };
+    static const uint8_t nargs[SYS_COUNT] = { 1,1,0,0,3,5,4,0,3,2, 0,1,2,2,3,1,2,3, 2,2,2 };
     uint8_t *p = (uint8_t *)NXP_TRAMP_BASE;
     uint32_t stub[SYS_COUNT];
 
@@ -498,7 +515,9 @@ void ring3_setup_tramp(void)
     t[14] = stub[SYS_CLS];     t[15] = stub[SYS_SETCOLOR];
     t[16] = stub[SYS_GETUSER]; t[17] = stub[SYS_GETDATE];
     t[18] = stub[SYS_READFILE]; t[19] = stub[SYS_SPAWN];
-    t[20] = stub[SYS_PROCS];
+    t[20] = stub[SYS_PROCS];   t[21] = stub[SYS_WRITEFILE];
+    t[22] = stub[SYS_LISTDIR]; t[23] = stub[SYS_FSOP];
+    t[24] = stub[SYS_SYSOP];
 }
 
 /* ---- descriptor helpers ---- */

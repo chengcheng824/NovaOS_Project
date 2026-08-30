@@ -39,6 +39,18 @@ typedef struct {
                                           * returns pid (1..4), -1 = error    */
     int  (*procs)(char *buf, u32 max);   /* "pid name\n" lines of the live
                                           * processes into buf, returns count */
+    int  (*writefile)(const char *name, unsigned char *data, u32 len);
+                                         /* create/overwrite a NovaFS file
+                                          * (owner checks apply), returns
+                                          * len or -1                        */
+    int  (*listdir)(char *buf, u32 max); /* ls of the cwd into buf, entries  */
+    int  (*fsop)(u32 op, const char *name);
+                                         /* 1=mkdir 2=rmdir 3=rd 4=rm 5=cd
+                                          * 6=format 7=fsinfo (prints)       */
+    int  (*sysop)(u32 op, const char *name);
+                                         /* 1=useradd 2=userdel 3=passwd
+                                          * 4=su 5=mkdemo 6=acpi 7=reboot
+                                          * 8=shutdown 9=halt 10=fg 11=kill  */
 } nxp_api_t;
 
 /* set_color() foreground values (VGA attribute low nibble) */

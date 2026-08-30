@@ -68,6 +68,8 @@ int fs_remove(const char *name);
 int fs_list(void (*cb)(const char *name, int type, uint32_t size));
 int fs_list_dir(int dir, void (*cb)(const char*,int,uint32_t));
 int fs_space(uint32_t *used_blocks, uint32_t *used_inodes, uint32_t *used_bytes);
+void fs_setuid(uint8_t uid);   /* owner uid for newly created inodes (0=root) */
+void fs_setcwd(int idx);       /* per-process cwd switch (validated)          */
 
 /* directory ops */
 int fs_mkdir(const char *name);

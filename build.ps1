@@ -72,10 +72,11 @@ if (Test-Path "$PSScriptRoot\programs") {
             $file = New-Object byte[] (4 + $code.Length)
             $file[0]=0x4E; $file[1]=0x58; $file[2]=0x50; $file[3]=0x01
             [Array]::Copy($code,0,$file,4,$code.Length)
-            if ($file.Length -gt 6*512) { Write-Host "[ERR] $fname = $($file.Length) B exceeds the 3072 B file limit"-ForegroundColor Red; exit 1 }
+            if ($file.Length -gt (6+128)*512) { Write-Host "[ERR] $fname = $($file.Length) B exceeds the 68608 B file limit"-ForegroundColor Red; exit 1 }
             if ($nextInode -ge 256) { Write-Host "[ERR] too many programs"-ForegroundColor Red; exit 1 }
 
             # inode entry: type=1(T_FILE) parent=0(root) name size blocks[]
+            # (pad[0..3] at inode offset 56 = indirect block, +3072 B onward)
             $ino = $INO_OFF + $nextInode * 64
             $f[$ino+0] = 1
             $nb = [Text.Encoding]::ASCII.GetBytes($fname)
@@ -83,11 +84,22 @@ if (Test-Path "$PSScriptRoot\programs") {
             [Array]::Copy($nb,0,$f,$ino+4,$nb.Length)
             [BitConverter]::GetBytes([uint32]$file.Length).CopyTo($f,$ino+28)
             $nblocks = [Math]::Ceiling($file.Length / 512.0)
-            for ($b = 0; $b -lt $nblocks; $b++) {
+            for ($b = 0; $b -lt [Math]::Min(6, $nblocks); $b++) {
                 $blk = $nextBlock++
                 [BitConverter]::GetBytes([uint32]$blk).CopyTo($f,$ino+32+$b*4)
                 [Array]::Copy($file,$b*512,$f,$DAT_OFF+$blk*512,[Math]::Min(512,$file.Length-$b*512))
                 $f[$BMP_OFF + ($blk -shr 3)] = $f[$BMP_OFF + ($blk -shr 3)] -bor [byte](1 -shl ($blk -band 7))
+            }
+            if ($nblocks -gt 6) {
+                $indBlk = $nextBlock++
+                [BitConverter]::GetBytes([uint32]$indBlk).CopyTo($f,$ino+56)   # pad[0..3]
+                $f[$BMP_OFF + ($indBlk -shr 3)] = $f[$BMP_OFF + ($indBlk -shr 3)] -bor [byte](1 -shl ($indBlk -band 7))
+                for ($b = 6; $b -lt $nblocks; $b++) {
+                    $blk = $nextBlock++
+                    [BitConverter]::GetBytes([uint32]$blk).CopyTo($f, $DAT_OFF + $indBlk*512 + ($b-6)*4)
+                    [Array]::Copy($file,$b*512,$f,$DAT_OFF+$blk*512,[Math]::Min(512,$file.Length-$b*512))
+                    $f[$BMP_OFF + ($blk -shr 3)] = $f[$BMP_OFF + ($blk -shr 3)] -bor [byte](1 -shl ($blk -band 7))
+                }
             }
             Write-Host ("    + $fname ({0} B)" -f $file.Length) -ForegroundColor Gray
             $nextInode++

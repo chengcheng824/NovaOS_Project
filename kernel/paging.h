@@ -17,7 +17,7 @@ void ring3_init(const void *api_table);
 /* build the trampoline page (call right before entering a program) */
 void ring3_setup_tramp(void);
 
-/* asm: drop to Ring 3 via iret; returns when the program exits     */
+/* asm: park-and-drop into Ring 3 (checkpoint model, see entry.asm)  */
 uint32_t ring3_enter(uint32_t entry_eip, uint32_t user_esp, uint32_t eax_val);
 
 /* asm: restore the saved kernel context (exit / user fault)        */

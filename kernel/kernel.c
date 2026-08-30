@@ -322,7 +322,6 @@ static int kbuf_pop(void)
 }
 
 /* move all pending controller bytes into mouse/kbd buffers */
-static char hx2(unsigned v);            /* DIAG hex digit (defined below) */
 static void ps2_drain(void)
 {
     for (int guard = 0; guard < 64; guard++) {
@@ -330,21 +329,8 @@ static void ps2_drain(void)
         if (!(st & 1)) break;
         uint8_t b = inb(KB_DATA);
         if (st & AUX_TAG) mouse_feed(b);
-        else {
-            kbuf_push(b);
-            serial_putc('[');           /* DIAG: raw scancode stream */
-            serial_putc(hx2(b >> 4));
-            serial_putc(hx2(b));
-            serial_putc(']');
-        }
+        else              kbuf_push(b);
     }
-}
-
-/* DIAG: one hex digit to serial */
-static char hx2(unsigned v)
-{
-    static const char hx[] = "0123456789ABCDEF";
-    return hx[v & 0xF];
 }
 
 /* hotkey seen by kb_poll, consumed by the syscall dispatcher */
@@ -547,7 +533,10 @@ static void cmd_date(void)
 
 /* ---- Shell ---- */
 #define CMD_MAX 128
-#define TXT_MAX  (6*512)
+#define TXT_MAX 16384   /* kernel cat/write buffer. Files on disk may be
+                         * 68608 B (Ring3 readfile/writefile see the full
+                         * size) - keep kernel BSS well below the fixed
+                         * page tables at 0x141000 */
 static char cmdline[CMD_MAX];
 static int  cmdlen = 0;
 static char textbuf[TXT_MAX];
@@ -596,7 +585,7 @@ static void cmd_help(void)
     set_color(C_LCYAN); vga_puts("  cat F   "); reset_color(); kputs("show file\n");
     set_color(C_LCYAN); vga_puts("  write F "); reset_color(); kputs("create file (end with .)\n");
     set_color(C_LCYAN); vga_puts("  rm F    "); reset_color(); kputs("delete file\n");
-    set_color(C_LCYAN); vga_puts("  run F   "); reset_color(); kputs("start a .nxp process (F.1/2/3 = slot)\n");
+    set_color(C_LCYAN); vga_puts("  run F   "); reset_color(); kputs("run .nsh script / start .nxp process\n");
     set_color(C_LCYAN); vga_puts("  procs   "); reset_color(); kputs("list running processes\n");
     set_color(C_LCYAN); vga_puts("  fg      "); reset_color(); kputs("resume suspended processes\n");
     set_color(C_LCYAN); vga_puts("  kill N  "); reset_color(); kputs("end process N (no N = all)\n");
@@ -753,21 +742,16 @@ typedef struct {
                                                    /* read a NovaFS file */
     int  (*spawn)(const char *name);              /* new process        */
     int  (*procs)(char *buf, uint32_t max);       /* list live processes */
+    int  (*writefile)(const char *name, const uint8_t *data, uint32_t len);
+                                                  /* save a file (owned) */
+    int  (*listdir)(char *buf, uint32_t max);     /* ls into a buffer   */
+    int  (*fsop)(uint32_t op, const char *name);  /* fs ops by opcode   */
+    int  (*sysop)(uint32_t op, const char *name); /* system ops by opcode */
 } nxp_api_t;
 
 static void nxp_api_putc(char c)              { kput(c); }
 static void nxp_api_puts(const char *s)       { if (s) kputs(s); }
-static int  nxp_api_getchar(void)
-{
-    int c = kb_poll();
-    if (c > 0) {                        /* DIAG: decoded key + value */
-        serial_puts("[k=");
-        serial_putc(hx2((unsigned)c >> 4));
-        serial_putc(hx2((unsigned)c));
-        serial_putc(']');
-    }
-    return c;
-}
+static int  nxp_api_getchar(void)             { return kb_poll(); }   /* -1 = empty */
 static void nxp_api_exit(void)                { }   /* Ring3 exit goes through the syscall stub */
 static void nxp_api_pixel(uint32_t x, uint32_t y, uint32_t rgb) { gfx_pixel((int)x, (int)y, rgb); }
 static void nxp_api_fill(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t rgb)
@@ -828,6 +812,98 @@ static int nxp_api_procs(char *buf, uint32_t max)
     return proc_list(buf, max);
 }
 
+/* write a file from Ring3 (NovaFS ownership checks apply) */
+static int nxp_api_writefile(const char *name, const uint8_t *data, uint32_t len)
+{
+    if (!name || !data || !len) return -1;
+    return fs_write(name, data, len);
+}
+
+/* ---- the syscall layer reuses the shell command implementations ---- */
+static void cmd_mkdir(const char *name);
+static void cmd_rmdir(const char *name);
+static void cmd_rd(const char *name);
+static void cmd_rm(const char *name);
+static void cmd_cd(const char *name);
+static void cmd_format(void);
+static void cmd_fsinfo(void);
+static void cmd_useradd(const char *name);
+static void cmd_userdel(const char *name);
+static void cmd_passwd(void);
+static void cmd_mkdemo(void);
+static void cmd_acpi(void);
+static void cmd_reboot(void);
+static void cmd_shutdown(void);
+static void cmd_halt(void);
+
+/* ls into a caller buffer, formatted like the shell's ls */
+static int   g_ls_n;
+static char *g_ls_p;
+static uint32_t g_ls_max, g_ls_o;
+static void ls_putc(char c) { if (g_ls_o + 1 < g_ls_max) g_ls_p[g_ls_o++] = c; }
+static void ls_puts(const char *s) { while (*s) ls_putc(*s++); }
+static void ls_dec(uint32_t v)
+{
+    char t[12]; int k = 0;
+    if (!v) t[k++] = '0';
+    while (v) { t[k++] = (char)('0' + v % 10); v /= 10; }
+    while (k--) ls_putc(t[k]);
+}
+static void ls_collect(const char *name, int type, uint32_t size)
+{
+    g_ls_n++;
+    if (!g_ls_p) return;
+    ls_puts(type == T_DIR ? "  [DIR]  " : "  [FILE] ");
+    ls_puts(name);
+    if (type != T_FILE) { ls_putc('\n'); return; }
+    ls_puts("   ("); ls_dec(size); ls_puts(" B)\n");
+}
+static int nxp_api_listdir(char *buf, uint32_t max)
+{
+    if (!buf || max == 0) return -1;
+    g_ls_p = buf; g_ls_max = max; g_ls_o = 0; g_ls_n = 0;
+    fs_list(ls_collect);
+    if (g_ls_o < max) buf[g_ls_o] = 0;
+    return g_ls_n;
+}
+
+/* filesystem ops by opcode: 1=mkdir 2=rmdir 3=rd 4=rm 5=cd 6=format 7=fsinfo */
+static int nxp_api_fsop(uint32_t op, const char *name)
+{
+    switch (op) {
+    case 1: cmd_mkdir(name);  return 0;
+    case 2: cmd_rmdir(name);  return 0;
+    case 3: cmd_rd(name);     return 0;
+    case 4: cmd_rm(name);     return 0;
+    case 5: cmd_cd(name);     return 0;
+    case 6: cmd_format();     return 0;
+    case 7: cmd_fsinfo();     return 0;
+    default: return -1;
+    }
+}
+
+/* system ops by opcode: 1=useradd 2=userdel 3=passwd 4=su 5=mkdemo
+ * 6=acpi 7=reboot 8=shutdown 9=halt 10=fg(resume all) 11=kill pid */
+static int nxp_api_sysop(uint32_t op, const char *name)
+{
+    switch (op) {
+    case 1:  cmd_useradd(name); return 0;
+    case 2:  cmd_userdel(name); return 0;
+    case 3:  cmd_passwd();      return 0;
+    case 4:  cmd_su(name);      return 0;
+    case 5:  cmd_mkdemo();      return 0;
+    case 6:  cmd_acpi();        return 0;
+    case 7:  cmd_reboot();      return 0;
+    case 8:  cmd_shutdown();    return 0;
+    case 9:  cmd_halt();        return 0;
+    case 10: proc_resume_all(); return 0;
+    case 11:
+        return (name && name[0] >= '1' && name[0] <= '4' && name[1] == 0)
+                ? proc_kill(name[0] - '0') : -1;
+    default: return -1;
+    }
+}
+
 /* read a NovaFS file (current dir) into a user buffer - the file access
  * nsh.nxp needs to load .nsh scripts, handy for any other program too */
 static int nxp_api_readfile(const char *name, uint8_t *buf, uint32_t max)
@@ -849,7 +925,8 @@ static nxp_api_t nxp_api = {
     nxp_api_mouse,
     nxp_api_getpixel,
     nxp_api_cls, nxp_api_setcolor, nxp_api_getuser, nxp_api_getdate,
-    nxp_api_readfile, nxp_api_spawn, nxp_api_procs
+    nxp_api_readfile, nxp_api_spawn, nxp_api_procs, nxp_api_writefile,
+    nxp_api_listdir, nxp_api_fsop, nxp_api_sysop
 };
 
 /* "name.D.nxp" selects process slot D (0-3); plain "name.nxp" = slot 0 */
@@ -864,21 +941,21 @@ static int slot_from_name(const char *name)
     return 0;
 }
 
-/* load an .nxp image into a process slot; 0 = ok, -1 = error (printed) */
+/* load an .nxp image into a process slot; 0 = ok, -1 = error (printed).
+ * Files up to ~67 KB (6 direct + 128 indirect blocks) are read straight
+ * into the slot; the rest of the 128 KB slot is zeroed as slack + BSS. */
 static int nxp_load_slot(const char *name, int slot)
 {
     if(!fs_is_ready()){ kputs("NovaFS not formatted. Use 'format'.\n"); return -1; }
     int sz = fs_size(name);
     if(sz < 5){ kputs("run: no such file\n"); return -1; }
-    if(sz > TXT_MAX) sz = TXT_MAX;
-    for(int i=0;i<TXT_MAX;i++) textbuf[i]=0;
-    fs_read(name, (uint8_t*)textbuf, TXT_MAX);
-    if(textbuf[0]!='N' || textbuf[1]!='X' || textbuf[2]!='P' || textbuf[3]!=1){
+    uint8_t *dst = (uint8_t *)proc_slot_base(slot);
+    fs_read(name, dst, 0x1F000u);
+    if(dst[0]!='N' || dst[1]!='X' || dst[2]!='P' || dst[3]!=1){
         kputs("run: not a .nxp program (bad magic - .nsh? try nsh.nxp)\n"); return -1;
     }
-    uint8_t *dst = (uint8_t *)proc_slot_base(slot);
-    for(int i=0;i<sz;i++) dst[i] = (uint8_t)textbuf[i];
-    for(int i=sz;i<8192;i++) dst[i] = 0;   /* slack + BSS */
+    if(sz > 0x1F000) sz = 0x1F000;
+    for(int i = sz; i < 0x1F000; i++) dst[i] = 0;   /* slack + big BSS */
     return 0;
 }
 
@@ -888,11 +965,209 @@ static int nxp_load_slot(const char *name, int slot)
  * and fall back to the shell prompt) */
 static int g_park_first = 0;
 
-/* shell `run`: spawn, park the shell, and let the scheduler run until
- * every process is gone (or F12 kills them all) */
+/* ================= .nsh script engine (kernel side) =================
+ * Same batch-compatible subset as nsh.nxp's engine (keep the syntax in
+ * sync with programs/nsh.c): rem/::/@/echo on|off/set %var%/if [not]
+ * A==B/goto labels/pause/exit. Everything else is delegated to
+ * process_cmd(), so a script can use EVERY NovaSh command (ls, mkdir,
+ * write, useradd, run ...). */
+#define NSH_MAX 3072
+#define NSH_L   128
+#define NSVARS  8
+#define NNAME   12
+#define NVAL    32
+
+static char nsh_sbuf[NSH_MAX];
+static char nsh_line[NSH_L];
+static char nsh_exp[NSH_L + NVAL];
+static char nsv_name[NSVARS][NNAME];
+static char nsv_val[NSVARS][NVAL];
+static int  nsh_echo_on = 1;
+static int  nsh_in_script = 0;
+static int  nsh_goto_flag = 0;
+static char nsh_goto_target[24];
+
+static void process_cmd(void);           /* delegation target (below) */
+
+static char *nsh_var_get(const char *name, int len)
+{
+    for (int i = 0; i < NSVARS; i++) {
+        if (!nsv_name[i][0] || str_len(nsv_name[i]) != len) continue;
+        int j = 0;
+        while (j < len && nsv_name[i][j] == name[j]) j++;
+        if (j == len) return nsv_val[i];
+    }
+    return 0;
+}
+
+static void nsh_expand(const char *in, char *out)
+{
+    int o = 0;
+    for (int i = 0; in[i] && o < NSH_L + NVAL - 2; i++) {
+        if (in[i] != '%') { out[o++] = in[i]; continue; }
+        int j = i + 1;
+        while (in[j] && in[j] != '%') j++;
+        if (!in[j]) { out[o++] = '%'; continue; }        /* unmatched % */
+        char *v = nsh_var_get(in + i + 1, j - i - 1);
+        if (!v) { out[o++] = '%'; continue; }            /* unknown var */
+        while (*v && o < NSH_L + NVAL - 2) out[o++] = *v++;
+        i = j;
+    }
+    out[o] = 0;
+}
+
+/* one script line; returns 1 = stop the script */
+static int nsh_exec(char *line, int silent)
+{
+    if (*line == '@') { silent = 1; line++; }
+    while (*line == ' ') line++;
+    if (!*line || *line == ':') return 0;                /* empty / label */
+    if (!silent) { kputs(line); kput('\n'); }
+
+    int i = 0;
+    while (line[i] && line[i] != ' ') i++;
+    char *args = line + i;
+    if (*args) { *args = 0; args++; while (*args == ' ') args++; }
+    char *cmd = line;
+
+    if (str_eq(cmd, "rem")) return 0;
+    if (str_eq(cmd, "echo")) {
+        if (!*args) { kput('\n'); return 0; }
+        if (str_eq(args, "off")) { nsh_echo_on = 0; return 0; }
+        if (str_eq(args, "on"))  { nsh_echo_on = 1; return 0; }
+        kputs(args); kput('\n');
+        return 0;
+    }
+    if (str_eq(cmd, "pause")) { kputs("Press a key\n"); kb_read(); return 0; }
+    if (str_eq(cmd, "set")) {
+        char *eq = 0;
+        for (char *q = args; *q; q++) if (*q == '=') { eq = q; break; }
+        if (!eq) return 0;
+        *eq = 0;
+        char *nm = args, *vv = eq + 1;
+        while (*vv == ' ') vv++;
+        int nl = str_len(nm);
+        while (nl && nm[nl - 1] == ' ') nm[--nl] = 0;
+        int vl = str_len(vv);
+        if (!nl || nl >= NNAME || vl >= NVAL) { kputs("set: bad\n"); return 0; }
+        int slot = -1;
+        for (int k = 0; k < NSVARS && slot < 0; k++)
+            if (nsv_name[k][0] && str_eq(nsv_name[k], nm)) slot = k;
+        if (slot < 0)
+            for (int k = 0; k < NSVARS && slot < 0; k++)
+                if (!nsv_name[k][0]) slot = k;
+        if (slot < 0) { kputs("set: full\n"); return 0; }
+        for (int k = 0; k < nl; k++) nsv_name[slot][k] = nm[k];
+        nsv_name[slot][nl] = 0;
+        for (int k = 0; k < vl; k++) nsv_val[slot][k] = vv[k];
+        nsv_val[slot][vl] = 0;
+        return 0;
+    }
+    if (str_eq(cmd, "goto")) {
+        if (*args == ':') args++;
+        int m = 0;
+        while (args[m] && args[m] != ' ' && m < 23) {
+            nsh_goto_target[m] = args[m];
+            m++;
+        }
+        nsh_goto_target[m] = 0;
+        if (m) nsh_goto_flag = 1;
+        return 0;
+    }
+    if (str_eq(cmd, "if")) {
+        char *s = args;
+        int invert = 0;
+        if (s[0] == 'n' && s[1] == 'o' && s[2] == 't' && (s[3] == ' ' || s[3] == 0)) {
+            invert = 1;
+            s += 3;
+            while (*s == ' ') s++;
+        }
+        char *eq = 0;
+        for (char *q = s; q[0] && q[1]; q++)
+            if (q[0] == '=' && q[1] == '=') { eq = q; break; }
+        if (!eq) { kputs("need ==\n"); return 0; }
+        *eq = 0;
+        char *L = s, *R = eq + 2;
+        while (*R == ' ') R++;
+        char *rest = R;
+        while (*rest && *rest != ' ') rest++;
+        if (*rest) { *rest = 0; rest++; while (*rest == ' ') rest++; }
+        int c2 = str_eq(L, R);
+        if (invert) c2 = !c2;
+        if (c2 && *rest) return nsh_exec(rest, 1);
+        return 0;
+    }
+    if (str_eq(cmd, "exit")) return 1;                   /* stop the script */
+
+    /* delegate: a real NovaSh command, rebuilt into the shell buffer */
+    int n = 0;
+    for (char *q = cmd; *q && n < CMD_MAX - 1; q++) cmdline[n++] = *q;
+    if (*args && n < CMD_MAX - 1) cmdline[n++] = ' ';
+    for (char *q = args; *q && n < CMD_MAX - 1; q++) cmdline[n++] = *q;
+    cmdline[n] = 0;
+    cmdlen = n;
+    process_cmd();
+    return 0;
+}
+
+static void nsh_run_script(const char *file)
+{
+    if (nsh_in_script) { kputs("run: no nested scripts\n"); return; }
+    if(!fs_is_ready()){ kputs("NovaFS not formatted.\n"); return; }
+    int n = fs_size(file);
+    if(n <= 0){ kputs("run: no such file\n"); return; }
+    for(int i = 0; i < NSH_MAX; i++) nsh_sbuf[i] = 0;
+    fs_read(file, (uint8_t*)nsh_sbuf, NSH_MAX - 1);
+    nsh_in_script = 1;
+    char *lp = nsh_sbuf;
+    while (*lp) {
+        int rl = 0;
+        char *e = lp;
+        while (*e && *e != '\n') {
+            if (*e != '\r' && rl < NSH_L - 1) nsh_line[rl++] = *e;
+            e++;
+        }
+        nsh_line[rl] = 0;
+        nsh_expand(nsh_line, nsh_exp);
+        int stop = nsh_exec(nsh_exp, !nsh_echo_on);
+        if (nsh_goto_flag) {
+            char *q = nsh_sbuf;
+            int found = 0;
+            while (*q && !found) {
+                char *e2 = q;
+                while (*e2 && *e2 != '\n') e2++;
+                char sv = *e2;
+                *e2 = 0;
+                char *t2 = q;
+                while (*t2 == ' ') t2++;
+                if (*t2 == ':') {
+                    t2++;
+                    int m = 0;
+                    while (nsh_goto_target[m] && t2[m] == nsh_goto_target[m]) m++;
+                    if (!nsh_goto_target[m] && (t2[m] == 0 || t2[m] == ' ')) found = 1;
+                }
+                *e2 = sv;
+                if (!found) q = sv ? e2 + 1 : e2;
+            }
+            if (found) { lp = q; nsh_goto_flag = 0; continue; }
+            kputs("no label\n");
+            break;
+        }
+        if (stop) break;
+        lp = *e ? e + 1 : e;
+    }
+    nsh_in_script = 0;
+    nsh_goto_flag = 0;
+}
+
+/* shell `run`: a .nsh file runs right here in the kernel; a .nxp
+ * spawns, parks the shell, and lets the scheduler run until every
+ * process is gone (or F12 kills them all) */
 static void cmd_run(const char *name)
 {
-    if(!name || !*name){ kputs("usage: run <file.nxp>\n"); return; }
+    if(!name || !*name){ kputs("usage: run <file.nxp | file.nsh>\n"); return; }
+    int nl = str_len(name);
+    if (nl > 4 && str_eq(name + nl - 4, ".nsh")) { nsh_run_script(name); return; }
     int slot = slot_from_name(name);
     if(nxp_load_slot(name, slot) < 0) return;
     int pid = proc_spawn(slot, name);
@@ -903,14 +1178,12 @@ static void cmd_run(const char *name)
     g_park_first = 1;                      /* the resume below is the first entry */
     main_checkpoint();                     /* park the shell context */
     if (!g_park_first) {                   /* scheduler released us */
-        serial_puts("[ret]\n");            /* DIAG: scheduler released us */
         kputs(proc_any() ? "[proc] suspended - 'fg' resumes, 'kill' ends\n"
                          : "[proc] all processes exited\n");
         return;
     }
     g_park_first = 0;
     proc_set_current(slot);                /* first tick must save, not roll back */
-    serial_puts("[jmp]\n");                /* DIAG: entering the process */
     jmp_user(proc_frame(slot));            /* in until all exit (ring3_leave resumes) */
 }
 
@@ -935,14 +1208,12 @@ static void cmd_fg(void)
     g_park_first = 1;
     main_checkpoint();
     if (!g_park_first) {                   /* scheduler released us */
-        serial_puts("[ret]\n");
         kputs(proc_any() ? "[proc] suspended - 'fg' resumes, 'kill' ends\n"
                          : "[proc] all processes exited\n");
         return;
     }
     g_park_first = 0;
     proc_set_current(slot);
-    serial_puts("[jmp]\n");
     jmp_user(proc_frame(slot));            /* in until all exit (ring3_leave resumes) */
 }
 
@@ -1079,7 +1350,7 @@ static void cmd_rmdir(const char *name)
     int r = fs_rmdir(name);
     if(r == -1) kputs("rmdir: no such directory\n");
     else if(r == -2) kputs("rmdir: directory not empty\n");
-    else if(r == -3) kputs("rmdir: cannot delete cwd or its ancestor\n");
+    else if(r == -4) kputs("rmdir: permission denied\n");
 }
 
 static void cmd_rd(const char *name)
@@ -1090,6 +1361,7 @@ static void cmd_rd(const char *name)
     if(r == -1)      kputs("rd: no such directory\n");
     else if(r == -2) kputs("rd: not a directory (use rm for files)\n");
     else if(r == -3) kputs("rd: cannot delete cwd or its ancestor\n");
+    else if(r == -4) kputs("rd: permission denied\n");
     else             kputs("Directory removed.\n");
 }
 
@@ -1136,8 +1408,10 @@ static void cmd_rm(const char *name)
 {
     if(!name || !*name){ kputs("usage: rm <file>\n"); return; }
     if(!fs_is_ready()){ kputs("NovaFS not formatted.\n"); return; }
-    if(fs_remove(name) < 0) kputs("rm: failed (is it a directory? use rmdir)\n");
-    else kputs("Deleted.\n");
+    int r = fs_remove(name);
+    if(r == -2)      kputs("rm: permission denied\n");
+    else if(r < 0)   kputs("rm: failed (is it a directory? use rmdir)\n");
+    else             kputs("Deleted.\n");
 }
 
 static void process_cmd(void) {
@@ -1248,6 +1522,15 @@ static uint32_t pass_hash(const char *s)
     return h;
 }
 
+/* numeric owner id for NovaFS permission checks (root = 0, which is also
+ * what every inode on pre-permission disks carries) */
+static uint8_t user_uid(const char *name)
+{
+    if (str_eq(name, "root")) return 0;
+    uint8_t u = (uint8_t)(pass_hash(name) & 0xFF);
+    return u ? u : 1;
+}
+
 static int hex_val(char c)
 {
     if (c >= '0' && c <= '9') return c - '0';
@@ -1343,7 +1626,10 @@ static int login_set_user(const char *user, uint32_t h)
     fs_cd("/");
     int sz = passwd_load();
     if (sz < 0) { fs_cd_path(cwdbuf); return -1; }   /* oversize: don't clobber it */
-    static char fresh[TXT_MAX];
+    /* compact /passwd IN PLACE: the write pointer never passes the read
+     * pointer, so no second buffer is needed (a fresh[TXT_MAX] buffer once
+     * pushed kernel BSS into the page-table area at 0x141000 and froze
+     * the boot inside ring3_init) */
     int fn = 0, len = str_len(user);
     for (int i = 0; i < sz; ) {
         int j = i;
@@ -1352,14 +1638,14 @@ static int login_set_user(const char *user, uint32_t h)
         int m = 0;
         while (skip && m < len && textbuf[i + m] == user[m]) m++;
         if (skip && m == len) { i = j + 1; continue; }   /* old line for user */
-        while (i <= j && fn < TXT_MAX - 1) fresh[fn++] = textbuf[i++];
+        while (i <= j && fn < TXT_MAX - 1) textbuf[fn++] = textbuf[i++];
     }
     if (fn + len + 10 >= TXT_MAX) { fs_cd_path(cwdbuf); return -1; }
-    for (int k = 0; k < len; k++) fresh[fn++] = user[k];
-    fresh[fn++] = ':';
-    hex8(&fresh[fn], h); fn += 8;
-    fresh[fn++] = '\n';
-    int w = fs_write("passwd", (uint8_t*)fresh, (uint32_t)fn);
+    for (int k = 0; k < len; k++) textbuf[fn++] = user[k];
+    textbuf[fn++] = ':';
+    hex8(&textbuf[fn], h); fn += 8;
+    textbuf[fn++] = '\n';
+    int w = fs_write("passwd", (uint8_t*)textbuf, (uint32_t)fn);
     fs_cd_path(cwdbuf);
     return w;
 }
@@ -1372,7 +1658,7 @@ static int login_del_user(const char *user)
     fs_cd("/");
     int sz = passwd_load(), found = 0;
     if (sz < 0) { fs_cd_path(cwdbuf); return -1; }   /* oversize: don't clobber it */
-    static char fresh[TXT_MAX];
+    /* in-place compaction, same as login_set_user (no second buffer) */
     int fn = 0, len = str_len(user);
     for (int i = 0; i < sz; ) {
         int j = i;
@@ -1381,9 +1667,9 @@ static int login_del_user(const char *user)
         int m = 0;
         while (hit && m < len && textbuf[i + m] == user[m]) m++;
         if (hit && m == len) { found = 1; i = j + 1; continue; }
-        while (i <= j && fn < TXT_MAX - 1) fresh[fn++] = textbuf[i++];
+        while (i <= j && fn < TXT_MAX - 1) textbuf[fn++] = textbuf[i++];
     }
-    int w = found ? fs_write("passwd", (uint8_t*)fresh, (uint32_t)fn) : -1;
+    int w = found ? fs_write("passwd", (uint8_t*)textbuf, (uint32_t)fn) : -1;
     fs_cd_path(cwdbuf);
     return w;
 }
@@ -1420,6 +1706,7 @@ static void login_run(void)
         if (login_find_hash(user, &h) && pass_hash(pass) == h) {
             for (int i = 0; i < (int)sizeof(g_cur_user); i++)
                 g_cur_user[i] = user[i];
+            fs_setuid(user_uid(user));       /* file ownership follows login */
             /* land in the user's home directory (root stays at /) */
             fs_cd("/");
             if (!str_eq(user, LOGIN_USER) && fs_cd("home") == 0) {
@@ -1534,6 +1821,7 @@ static void cmd_su(const char *name)
     }
     for (int i = 0; i < (int)sizeof(g_cur_user); i++)
         g_cur_user[i] = name[i];
+    fs_setuid(user_uid(name));           /* file ownership follows su */
     /* land in the new user's home directory (root stays at /) */
     fs_cd("/");
     if (!str_eq(name, LOGIN_USER) && fs_cd("home") == 0) {

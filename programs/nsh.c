@@ -1,39 +1,34 @@
-/* nsh.nxp - NovaSh subset shell + .nsh script engine, Ring 3.
+/* nsh.nxp - the FULL NovaSh, running as a process in Ring 3.
  *
  * Build: build.ps1 compiles every programs\*.c (except nxp_entry.c)
- * and injects the result into the NovaFS template. Launch from the
- * kernel NovaSh with:   run nsh.nxp
+ * and injects the result into the NovaFS template (files up to ~67 KB
+ * via the indirect-block scheme). Launch from the kernel NovaSh with:
+ *   run nsh.nxp
  *
- * .nsh scripts are plain text files (create with NovaSh 'write') in a
- * .bat-compatible subset, executed here by API->readfile() + the SAME
- * command dispatcher the interactive prompt uses. Kept deliberately
- * tiny so the flat binary stays inside the 3072 B NovaFS limit:
+ * The complete command set of the kernel shell is available here:
+ *   help ver about echo X cls date whoami mem exit logout
+ *   ls cd mkdir rmdir rd rm cat write format fsinfo mkdemo
+ *   useradd userdel su passwd acpi reboot shutdown halt
+ *   run F.nsh/.nxp  procs fg kill N  pause
+ * Filesystem / user / power commands are syscalls (listdir/fsop/sysop)
+ * that reuse the kernel's own command implementations; file ownership
+ * and the process cwd apply exactly as in the kernel shell.
  *
- *   @cmd               run one line without echoing it
- *   @echo off / on     stop / resume echoing script lines
- *   rem ... / :: ...   comments
- *   echo text          print text ('echo' alone prints ECHO is on)
- *   set N=V            variables, expanded as %N% (8 vars, name <= 11,
- *                      value <= 31 chars, unknown names stay literal)
- *   :label  goto L     labels + jumps (case sensitive, 'goto :L' ok)
- *   if [not] A==B cmd  string compare, no spaces in A/B (same quoting on
- *                      both sides cancels out)
- *   pause              wait for any key
- *   NAME.nsh           an unknown word is tried as a script (batch way)
- *   exit               leave the script / the shell
- *   help ver cls       plain commands
+ * Plus the .bat-compatible .nsh script engine (identical syntax to the
+ * kernel-side engine in kernel.c):
+ *   @cmd / @echo off|on   rem / ::    echo text    set N=V, use as %N%
+ *   :label / goto L       if [not] A==B cmd       pause      exit
+ * Typing NAME.nsh runs it; `run F.nxp` spawns a new process.
  *
- * (whoami/date/mem and colored output were cut for size - use the
- * kernel NovaSh. All buffers live in .bss, which the objcopy -j flags
- * drop from the flat binary - keep it that way or the 3072 B limit
- * will bite.) */
+ * Everything big lives in .bss, which objcopy -j drops from the flat
+ * binary. */
 #include "nxp.h"
 
 #define LINE_MAX 128
 #define NVARS    8
 #define NAMELEN  12
 #define VALLEN   32
-#define SCR_MAX  3072
+#define SCR_MAX  16384
 
 static int str_eq(const char *a, const char *b)
 {
@@ -44,6 +39,14 @@ static int str_len(const char *s) { int n = 0; while (s[n]) n++; return n; }
 
 static void p(char c)         { API->putc(c); }
 static void ps(const char *s) { API->puts(s); }
+
+static void pdec(u32 v)
+{
+    char t[12]; int k = 0;
+    if (!v) t[k++] = '0';
+    while (v) { t[k++] = (char)('0' + v % 10); v /= 10; }
+    while (k--) p(t[k]);
+}
 
 /* ---- batch variables (bss, zeroed by the kernel loader) ---- */
 static char vname[NVARS][NAMELEN];
@@ -91,8 +94,8 @@ static void retail(int cur, int len)
     for (int i = cur; i < len; i++) p('\v');
 }
 
-static int  exec_line(char *line, int silent);
-static int  run_script(const char *file);
+static int  exec_line(char *l, int silent);
+static int  run_script(const char *file);   /* 0 = ran, -1 = unreadable */
 
 static int run_script(const char *file)
 {
@@ -133,7 +136,7 @@ static int run_script(const char *file)
                 if (!found) q = sv ? e2 + 1 : e2;
             }
             if (found) { lp = q; goto_flag = 0; continue; }
-            ps("no label\n");
+            ps("goto: no label\n");
             break;
         }
         if (stop) break;
@@ -145,22 +148,22 @@ static int run_script(const char *file)
 }
 
 /* one command line, interactive or script; returns 1 = stop script */
-static int exec_line(char *line, int silent)
+static int exec_line(char *l, int silent)
 {
-    if (*line == '@') { silent = 1; line++; }
-    while (*line == ' ') line++;
-    if (!*line || *line == ':') return 0;          /* empty / label */
-    if (!silent) { ps(line); p('\n'); }
+    if (*l == '@') { silent = 1; l++; }
+    while (*l == ' ') l++;
+    if (!*l || *l == ':') return 0;          /* empty / label */
+    if (!silent) { ps(l); p('\n'); }
 
     int i = 0;
-    while (line[i] && line[i] != ' ') i++;
-    char *args = line + i;
+    while (l[i] && l[i] != ' ') i++;
+    char *args = l + i;
     if (*args) {
         *args = 0;
         args++;
         while (*args == ' ') args++;
     }
-    char *cmd = line;
+    char *cmd = l;
 
     if (str_eq(cmd, "rem")) return 0;
     if (str_eq(cmd, "echo")) {
@@ -176,12 +179,11 @@ static int exec_line(char *line, int silent)
         return 0;
     }
     if (str_eq(cmd, "set")) {
-        char *eq2 = 0;
-        for (char *q = args; *q; q++)
-            if (*q == '=') { eq2 = q; break; }
-        if (!eq2) return 0;                 /* bare set: do nothing */
-        *eq2 = 0;
-        char *nm = args, *vv = eq2 + 1;
+        char *eq = 0;
+        for (char *q = args; *q; q++) if (*q == '=') { eq = q; break; }
+        if (!eq) { ps("set N=V\n"); return 0; }
+        *eq = 0;
+        char *nm = args, *vv = eq + 1;
         while (*vv == ' ') vv++;
         int nl = str_len(nm);
         while (nl && nm[nl - 1] == ' ') nm[--nl] = 0;
@@ -193,7 +195,7 @@ static int exec_line(char *line, int silent)
         if (slot < 0)
             for (int k = 0; k < NVARS && slot < 0; k++)
                 if (!vname[k][0]) slot = k;
-        if (slot < 0) { ps("set: bad\n"); return 0; }
+        if (slot < 0) { ps("set: full\n"); return 0; }
         for (int k = 0; k < nl; k++) vname[slot][k] = nm[k];
         vname[slot][nl] = 0;
         for (int k = 0; k < vl; k++) vval[slot][k] = vv[k];
@@ -237,18 +239,18 @@ static int exec_line(char *line, int silent)
         return 0;
     }
     if (str_eq(cmd, "run")) {
-        if (!*args) return 0;
+        if (!*args) { ps("run F.nsh / F.nxp\n"); return 0; }
         for (int k = 0; args[k]; k++)
             if (args[k] == ' ') { args[k] = 0; break; }
         int al = str_len(args);
         if (al > 4 && str_eq(args + al - 4, ".nsh")) {
             if (in_script) { ps("no nesting\n"); return 0; }
-            run_script(args);
+            if (run_script(args) < 0) ps("cannot read it\n");
             return 0;
         }
         int pid = API->spawn(args);                 /* .nxp: new process */
         if (pid < 0) { ps("spawn fail\n"); return 0; }
-        ps("pid "); p('0' + (char)pid); p('\n');
+        ps("pid "); pdec((u32)pid); p('\n');
         return 0;
     }
     if (str_eq(cmd, "procs")) {
@@ -258,17 +260,118 @@ static int exec_line(char *line, int silent)
         ps(pb);
         return 0;
     }
+
+    /* ---- filesystem commands (kernel implementations via fsop) ---- */
+    if (str_eq(cmd, "ls")) {
+        char lb[1024];
+        int n = API->listdir(lb, (u32)sizeof lb);
+        if (n < 0) { ps("ls failed\n"); return 0; }
+        if (n == 0) ps("  (empty)\n");
+        else ps(lb);
+        ps("  "); pdec((u32)n); ps(" item(s)\n");
+        return 0;
+    }
+    if (str_eq(cmd, "cd"))    { API->fsop(5, args); return 0; }
+    if (str_eq(cmd, "mkdir")) { if (!*args) { ps("mkdir D\n"); return 0; }
+                                API->fsop(1, args); return 0; }
+    if (str_eq(cmd, "rmdir")) { if (!*args) { ps("rmdir D\n"); return 0; }
+                                API->fsop(2, args); return 0; }
+    if (str_eq(cmd, "rd"))    { if (!*args) { ps("rd D\n"); return 0; }
+                                API->fsop(3, args); return 0; }
+    if (str_eq(cmd, "rm"))    { if (!*args) { ps("rm F\n"); return 0; }
+                                API->fsop(4, args); return 0; }
+    if (str_eq(cmd, "format")) { API->fsop(6, ""); return 0; }
+    if (str_eq(cmd, "fsinfo")) { API->fsop(7, ""); return 0; }
+    if (str_eq(cmd, "cat")) {
+        if (!*args) { ps("cat F\n"); return 0; }
+        static char cb[3072];
+        int n = API->readfile(args, (unsigned char *)cb, (u32)sizeof cb);
+        if (n < 0) { ps("no such file\n"); return 0; }
+        for (int k = 0; k < n; k++) p(cb[k]);
+        if (n > 0 && cb[n - 1] != '\n') p('\n');
+        return 0;
+    }
+    if (str_eq(cmd, "write")) {
+        if (!*args) { ps("write F\n"); return 0; }
+        ps("End with a single '.'\n");
+        static unsigned char wb[8192];
+        int wl = 0;
+        for (;;) {
+            char lb[LINE_MAX];
+            ps("> ");
+            int ll = 0;
+            for (;;) {
+                int c = API->getchar();
+                if (c < 0) continue;
+                if ((unsigned)c < 0x20 && c != '\n' && c != '\b') continue;
+                if (c == '\n') { p('\n'); break; }
+                if (c == '\b') { if (ll > 0) { ll--; p('\b'); } }
+                else if (ll < LINE_MAX - 1) { lb[ll++] = (char)c; p((char)c); }
+            }
+            lb[ll] = 0;
+            if (ll == 1 && lb[0] == '.') break;
+            for (int k = 0; lb[k] && wl < (int)sizeof wb - 1; k++) wb[wl++] = lb[k];
+            if (wl < (int)sizeof wb - 1) wb[wl++] = '\n';
+        }
+        int r = API->writefile(args, wb, (u32)wl);
+        if (r < 0) { ps("write failed (permission?)\n"); return 0; }
+        ps("Saved "); pdec((u32)r); ps(" bytes\n");
+        return 0;
+    }
+
+    /* ---- users / system (kernel implementations via sysop) ---- */
+    if (str_eq(cmd, "useradd"))  { if (!*args) { ps("useradd U\n"); return 0; }
+                                   API->sysop(1, args); return 0; }
+    if (str_eq(cmd, "userdel"))  { if (!*args) { ps("userdel U\n"); return 0; }
+                                   API->sysop(2, args); return 0; }
+    if (str_eq(cmd, "passwd"))   { API->sysop(3, ""); return 0; }
+    if (str_eq(cmd, "su"))       { if (!*args) { ps("su U\n"); return 0; }
+                                   API->sysop(4, args); return 0; }
+    if (str_eq(cmd, "mkdemo"))   { API->sysop(5, ""); return 0; }
+    if (str_eq(cmd, "acpi"))     { API->sysop(6, ""); return 0; }
+    if (str_eq(cmd, "reboot"))   { API->sysop(7, ""); return 0; }
+    if (str_eq(cmd, "shutdown")) { API->sysop(8, ""); return 0; }
+    if (str_eq(cmd, "halt"))     { API->sysop(9, ""); return 0; }
+    if (str_eq(cmd, "fg"))       { API->sysop(10, ""); ps("resumed\n"); return 0; }
+    if (str_eq(cmd, "kill"))     { if (!*args) { ps("kill N\n"); return 0; }
+                                   API->sysop(11, args); return 0; }
+    if (str_eq(cmd, "logout"))   { API->exit(); return 0; }
+
+    /* ---- local info commands ---- */
+    if (str_eq(cmd, "date")) {
+        char db[64];
+        if (API->getdate(db, (u32)sizeof db) > 0) ps(db);
+        return 0;
+    }
+    if (str_eq(cmd, "whoami")) {
+        char ub[32];
+        API->getuser(ub, (u32)sizeof ub);
+        ps(ub); p('\n');
+        return 0;
+    }
+    if (str_eq(cmd, "ver"))   { ps("nsh v1.0 - full NovaSh in Ring3\n"); return 0; }
+    if (str_eq(cmd, "about")) {
+        ps("NovaOS - a tiny 32-bit OS with preemptive multitasking\n");
+        return 0;
+    }
+    if (str_eq(cmd, "mem")) {
+        ps("Kernel@0x100000  Slots@0x300000  Tramp@0x400000  Stack@0x500000\n");
+        return 0;
+    }
+    if (str_eq(cmd, "cls")) { API->cls(); return 0; }
     if (str_eq(cmd, "exit")) {
         if (in_script) return 1;
         API->exit();
         return 1;
     }
     if (str_eq(cmd, "help")) {
-        ps(" help echo X cls exit set N=V if goto run procs pause\n"
+        ps(" help ver about echo X cls date whoami mem exit logout\n"
+           " ls cd mkdir rmdir rd rm cat write format fsinfo mkdemo\n"
+           " useradd userdel su passwd acpi reboot shutdown halt\n"
+           " run F.nsh/.nxp  procs fg kill N  pause  set N=V  if goto\n"
            " .nsh: @line rem :: echo on|off %N%\n");
         return 0;
     }
-    if (str_eq(cmd, "cls")) { API->cls(); return 0; }
 
     /* batch habit: an unknown word may be a script file name */
     if (!in_script && run_script(cmd) == 0) return 0;
@@ -280,17 +383,17 @@ static int exec_line(char *line, int silent)
 void nxp_main(void)
 {
     API->cls();
-    ps("try 'hello.nsh'\n");
+    ps("nsh v1.0 - full NovaSh in Ring 3\n");
 
     char exp[LINE_MAX + VALLEN];
     for (;;) {
         int len = 0;
+        int cur = 0;                                /* cursor inside line */
         char user[32];
         API->getuser(user, (u32)sizeof user);
         p('\n');
         ps(user);
         ps("@novaos:nsh# ");
-        int cur = 0;                                /* cursor inside line */
         for (;;) {
             int c = API->getchar();
             if (c < 0) continue;                    /* non-blocking poll */
