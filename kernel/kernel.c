@@ -597,13 +597,54 @@ static void cmd_useradd(const char *name);
 static void cmd_userdel(const char *name);
 static void cmd_su(const char *name);
 
+/* ---- global settings: nova.cfg in the NovaFS root ----
+ * The kernel reads it once right after the filesystem mounts (accent
+ * recolors the shell/login, quiet suppresses banner + self-test) and
+ * again on sysop 18 whenever the TUI settings panel saves the file. */
+uint8_t g_accent = C_LCYAN;
+int      g_quiet = 0;
+
+static void cfg_apply_text(char *buf)
+{
+    char *p = buf;
+    while (*p) {
+        char *line = p;
+        while (*p && *p != '\n') p++;
+        if (*p) *p++ = 0;
+        char *eq = line;
+        while (*eq && *eq != '=') eq++;
+        if (!*eq) continue;
+        *eq = 0;
+        char *v = eq + 1;
+        if (str_eq(line, "accent")) {
+            static const char *names[5] = { "cyan","green","yellow","magenta","white" };
+            static const uint8_t vals[5] = { C_LCYAN, C_LGREEN, C_YELLOW, C_LMAGENTA, C_WHITE };
+            for (int i = 0; i < 5; i++)
+                if (str_eq(v, names[i])) g_accent = vals[i];
+        } else if (str_eq(line, "quiet")) {
+            g_quiet = str_eq(v, "on");
+        }
+    }
+}
+
+static void cfg_load(void)
+{
+    static char cfg_buf[512];
+    if (!fs_is_ready()) return;
+    int sz = fs_size("nova.cfg");
+    if (sz <= 0) return;
+    for (int i = 0; i < 512; i++) cfg_buf[i] = 0;
+    fs_read("nova.cfg", (uint8_t *)cfg_buf, 511);
+    cfg_apply_text(cfg_buf);
+}
+
 static void shell_prompt(void)
 {
     con_cursor(1);      /* a killed TUI may have hidden the hw cursor */
     fs_getcwd(cwdbuf, sizeof(cwdbuf));
-    set_color(C_LCYAN); vga_puts("\n");
+    set_color(g_accent); vga_puts("\n");
     set_color(C_LGREEN); vga_puts(g_cur_user);
-    set_color(C_LCYAN); vga_puts("@novaos:");
+    set_color(g_accent); vga_puts("@novaos:");
     set_color(C_YELLOW); vga_puts(cwdbuf);
     set_color(C_DGRAY);  vga_puts("#");
     reset_color(); vga_putc(' ');
@@ -614,56 +655,56 @@ static void shell_prompt(void)
 static void cmd_help(void)
 {
     set_color(C_DGRAY); vga_puts(" --- commands ---\n"); reset_color();
-    set_color(C_LCYAN); vga_puts("  help    "); reset_color(); kputs("show this help\n");
-    set_color(C_LCYAN); vga_puts("  ver     "); reset_color(); kputs("kernel version\n");
-    set_color(C_LCYAN); vga_puts("  about   "); reset_color(); kputs("about NovaOS\n");
-    set_color(C_LCYAN); vga_puts("  echo X  "); reset_color(); kputs("print text\n");
-    set_color(C_LCYAN); vga_puts("  cls     "); reset_color(); kputs("clear screen\n");
-    set_color(C_LCYAN); vga_puts("  date    "); reset_color(); kputs("date and time\n");
-    set_color(C_LCYAN); vga_puts("  mem     "); reset_color(); kputs("memory layout\n");
-    set_color(C_LCYAN); vga_puts("  acpi    "); reset_color(); kputs("ACPI tables + \\_S5 info\n");
-    set_color(C_LCYAN); vga_puts("  netinfo "); reset_color(); kputs("NIC status (auto-dhcp)\n");
-    set_color(C_LCYAN); vga_puts("  dhcp    "); reset_color(); kputs("(re)request an IP via DHCP\n");
-    set_color(C_LCYAN); vga_puts("  ping IP "); reset_color(); kputs("send 4 ICMP echoes\n");
-    set_color(C_LCYAN); vga_puts("  dns NAME"); reset_color(); kputs("resolve a hostname\n");
-    set_color(C_LCYAN); vga_puts("  wget H "); reset_color(); kputs("HTTP GET -> NovaFS file\n");
-    set_color(C_LCYAN); vga_puts("  udpecho "); reset_color(); kputs("UDP echo server :7777 (q stops)\n");
-    set_color(C_LCYAN); vga_puts("  ls      "); reset_color(); kputs("list current directory\n");
-    set_color(C_LCYAN); vga_puts("  cd D    "); reset_color(); kputs("change directory (.. / /)\n");
-    set_color(C_LCYAN); vga_puts("  mkdir D "); reset_color(); kputs("create directory\n");
-    set_color(C_LCYAN); vga_puts("  rmdir D "); reset_color(); kputs("remove directory (must be empty)\n");
-    set_color(C_LCYAN); vga_puts("  rd D    "); reset_color(); kputs("force delete dir + contents\n");
-    set_color(C_LCYAN); vga_puts("  cat F   "); reset_color(); kputs("show file\n");
-    set_color(C_LCYAN); vga_puts("  write F "); reset_color(); kputs("create file (end with .)\n");
-    set_color(C_LCYAN); vga_puts("  rm F    "); reset_color(); kputs("delete file\n");
-    set_color(C_LCYAN); vga_puts("  run F   "); reset_color(); kputs("run .nsh script / start .nxp process\n");
-    set_color(C_LCYAN); vga_puts("  procs   "); reset_color(); kputs("list running processes\n");
-    set_color(C_LCYAN); vga_puts("  fg      "); reset_color(); kputs("resume suspended processes\n");
-    set_color(C_LCYAN); vga_puts("  kill N  "); reset_color(); kputs("end process N (no N = all)\n");
-    set_color(C_LCYAN); vga_puts("  mkdemo  "); reset_color(); kputs("create demo.nxp sample program\n");
-    set_color(C_LCYAN); vga_puts("  format  "); reset_color(); kputs("format NovaFS\n");
-    set_color(C_LCYAN); vga_puts("  fsinfo  "); reset_color(); kputs("filesystem info\n");
-    set_color(C_LCYAN); vga_puts("  passwd  "); reset_color(); kputs("change login password\n");
-    set_color(C_LCYAN); vga_puts("  useradd "); reset_color(); kputs("create a new user\n");
-    set_color(C_LCYAN); vga_puts("  userdel "); reset_color(); kputs("delete a user (root)\n");
-    set_color(C_LCYAN); vga_puts("  su U    "); reset_color(); kputs("switch to another user\n");
-    set_color(C_LCYAN); vga_puts("  whoami  "); reset_color(); kputs("show current user\n");
-    set_color(C_LCYAN); vga_puts("  logout  "); reset_color(); kputs("return to login screen\n");
-    set_color(C_LCYAN); vga_puts("  reboot  "); reset_color(); kputs("restart\n");
-    set_color(C_LCYAN); vga_puts("  shutdown"); reset_color(); kputs("  power off\n");
-    set_color(C_LCYAN); vga_puts("  halt    "); reset_color(); kputs("halt cpu\n");
+    set_color(g_accent); vga_puts("  help    "); reset_color(); kputs("show this help\n");
+    set_color(g_accent); vga_puts("  ver     "); reset_color(); kputs("kernel version\n");
+    set_color(g_accent); vga_puts("  about   "); reset_color(); kputs("about NovaOS\n");
+    set_color(g_accent); vga_puts("  echo X  "); reset_color(); kputs("print text\n");
+    set_color(g_accent); vga_puts("  cls     "); reset_color(); kputs("clear screen\n");
+    set_color(g_accent); vga_puts("  date    "); reset_color(); kputs("date and time\n");
+    set_color(g_accent); vga_puts("  mem     "); reset_color(); kputs("memory layout\n");
+    set_color(g_accent); vga_puts("  acpi    "); reset_color(); kputs("ACPI tables + \\_S5 info\n");
+    set_color(g_accent); vga_puts("  netinfo "); reset_color(); kputs("NIC status (auto-dhcp)\n");
+    set_color(g_accent); vga_puts("  dhcp    "); reset_color(); kputs("(re)request an IP via DHCP\n");
+    set_color(g_accent); vga_puts("  ping IP "); reset_color(); kputs("send 4 ICMP echoes\n");
+    set_color(g_accent); vga_puts("  dns NAME"); reset_color(); kputs("resolve a hostname\n");
+    set_color(g_accent); vga_puts("  wget H "); reset_color(); kputs("HTTP GET -> NovaFS file\n");
+    set_color(g_accent); vga_puts("  udpecho "); reset_color(); kputs("UDP echo server :7777 (q stops)\n");
+    set_color(g_accent); vga_puts("  ls      "); reset_color(); kputs("list current directory\n");
+    set_color(g_accent); vga_puts("  cd D    "); reset_color(); kputs("change directory (.. / /)\n");
+    set_color(g_accent); vga_puts("  mkdir D "); reset_color(); kputs("create directory\n");
+    set_color(g_accent); vga_puts("  rmdir D "); reset_color(); kputs("remove directory (must be empty)\n");
+    set_color(g_accent); vga_puts("  rd D    "); reset_color(); kputs("force delete dir + contents\n");
+    set_color(g_accent); vga_puts("  cat F   "); reset_color(); kputs("show file\n");
+    set_color(g_accent); vga_puts("  write F "); reset_color(); kputs("create file (end with .)\n");
+    set_color(g_accent); vga_puts("  rm F    "); reset_color(); kputs("delete file\n");
+    set_color(g_accent); vga_puts("  run F   "); reset_color(); kputs("run .nsh script / start .nxp process\n");
+    set_color(g_accent); vga_puts("  procs   "); reset_color(); kputs("list running processes\n");
+    set_color(g_accent); vga_puts("  fg      "); reset_color(); kputs("resume suspended processes\n");
+    set_color(g_accent); vga_puts("  kill N  "); reset_color(); kputs("end process N (no N = all)\n");
+    set_color(g_accent); vga_puts("  mkdemo  "); reset_color(); kputs("create demo.nxp sample program\n");
+    set_color(g_accent); vga_puts("  format  "); reset_color(); kputs("format NovaFS\n");
+    set_color(g_accent); vga_puts("  fsinfo  "); reset_color(); kputs("filesystem info\n");
+    set_color(g_accent); vga_puts("  passwd  "); reset_color(); kputs("change login password\n");
+    set_color(g_accent); vga_puts("  useradd "); reset_color(); kputs("create a new user\n");
+    set_color(g_accent); vga_puts("  userdel "); reset_color(); kputs("delete a user (root)\n");
+    set_color(g_accent); vga_puts("  su U    "); reset_color(); kputs("switch to another user\n");
+    set_color(g_accent); vga_puts("  whoami  "); reset_color(); kputs("show current user\n");
+    set_color(g_accent); vga_puts("  logout  "); reset_color(); kputs("return to login screen\n");
+    set_color(g_accent); vga_puts("  reboot  "); reset_color(); kputs("restart\n");
+    set_color(g_accent); vga_puts("  shutdown"); reset_color(); kputs("  power off\n");
+    set_color(g_accent); vga_puts("  halt    "); reset_color(); kputs("halt cpu\n");
 }
 
 static void cmd_ver(void)
 {
-    set_color(C_LCYAN); vga_puts("novaos"); reset_color();
+    set_color(g_accent); vga_puts("novaos"); reset_color();
     kputs(" v0.3  (32bit)  ");
     set_color(C_DGRAY); vga_puts(__DATE__); reset_color(); kput('\n');
 }
 
 static void cmd_about(void)
 {
-    set_color(C_LCYAN); vga_puts("novaos"); reset_color();
+    set_color(g_accent); vga_puts("novaos"); reset_color();
     kputs(" - tiny 32bit operating system\n");
     set_color(C_DGRAY); vga_puts("  boot: asm  |  kernel: c  |  shell: novash\n"); reset_color();
 }
@@ -970,7 +1011,8 @@ static int nxp_api_fsop(uint32_t op, const char *name)
 
 /* system ops by opcode: 1=useradd 2=userdel 3=passwd 4=su 5=mkdemo
  * 6=acpi 7=reboot 8=shutdown 9=halt 10=fg(resume all) 11=kill pid
- * 12=netinfo 13=ping 14=dhcp 15=dns 16=udpecho 17=wget */
+ * 12=netinfo 13=ping 14=dhcp 15=dns 16=udpecho 17=wget
+ * 18=cfg reload (tui settings panel re-reads nova.cfg) */
 static int nxp_api_sysop(uint32_t op, const char *name)
 {
     switch (op) {
@@ -993,6 +1035,7 @@ static int nxp_api_sysop(uint32_t op, const char *name)
     case 15: cmd_net_dns(name); return 0;
     case 16: cmd_net_udpecho(); return 0;
     case 17: cmd_wget(name);    return 0;
+    case 18: cfg_load();        return 0;
     default: return -1;
     }
 }
@@ -1795,11 +1838,11 @@ static void login_run(void)
     uint32_t h;
     for (;;) {
         kput('\n');
-        set_color(C_LCYAN); vga_puts("NovaOS login: "); reset_color();
+        set_color(g_accent); vga_puts("NovaOS login: "); reset_color();
         serial_puts("\nNovaOS login: ");
         read_line(user, sizeof(user), 0);
         serial_puts(user); serial_putc('\n');
-        set_color(C_LCYAN); vga_puts("Password: "); reset_color();
+        set_color(g_accent); vga_puts("Password: "); reset_color();
         serial_puts("Password: ");
         read_line(pass, sizeof(pass), 1);
         serial_putc('\n');
@@ -1910,7 +1953,7 @@ static void cmd_su(const char *name)
     if (str_eq(name, g_cur_user)) { kputs("su: already this user\n"); return; }
     if (!login_find_hash(name, &h)) { kputs("su: no such user\n"); return; }
     if (!is_root()) {
-        set_color(C_LCYAN); vga_puts("Password: "); reset_color();
+        set_color(g_accent); vga_puts("Password: "); reset_color();
         serial_puts("Password: ");
         read_line(pass, sizeof(pass), 1);
         serial_putc('\n');
@@ -2027,46 +2070,50 @@ static void gfx_probe(const char *tag)
 void kmain(void) {
     serial_init();
     int gfx = gfx_init();      /* capture font, find LFB, set VBE mode */
-    banner();
-    gfx_probe("after-banner");
-    boot_tag(1, "cpu",    "protected mode, 32-bit");
-    if (gfx) boot_tag(1, "video", "1024x768x32 LFB (VBE driver)");
-    else {
-        static const char *why[4] = { "", "font plane unreadable",
-                                      "no PCI display BAR", "no VBE extension" };
-        boot_tag(1, "video", why[gfx_fail_stage()]);
-        if (gfx_fail_stage() == 3) {
-            kputs("         id="); kput_hex(gfx_dbg_id());
-            kputs(" bar="); kput_hex(gfx_dbg_bar()); kput('\n');
+    int fr = fs_init();        /* mount BEFORE the banner: nova.cfg drives
+                                * accent + quiet, and quiet hides the rest */
+    cfg_load();
+    if (!g_quiet) {
+        banner();
+        gfx_probe("after-banner");
+        boot_tag(1, "cpu",    "protected mode, 32-bit");
+        if (gfx) boot_tag(1, "video", "1024x768x32 LFB (VBE driver)");
+        else {
+            static const char *why[4] = { "", "font plane unreadable",
+                                          "no PCI display BAR", "no VBE extension" };
+            boot_tag(1, "video", why[gfx_fail_stage()]);
+            if (gfx_fail_stage() == 3) {
+                kputs("         id="); kput_hex(gfx_dbg_id());
+                kputs(" bar="); kput_hex(gfx_dbg_bar()); kput('\n');
+            }
         }
+        boot_tag(1, "com1",   "115200 8N1");
     }
-    boot_tag(1, "com1",   "115200 8N1");
 
-    gfx_probe("pre-fs");
-    int fr = fs_init();
-    gfx_probe("post-fs");
-    if(fr == 0)      boot_tag(1, "novafs", "mounted");
-    else if(fr == 1) boot_tag(1, "novafs", "fresh disk, auto-formatted");
-    else             boot_tag(0, "novafs", "disk I/O error");
+    if (!g_quiet) {
+        if (fr == 0)      boot_tag(1, "novafs", "mounted");
+        else if (fr == 1) boot_tag(1, "novafs", "fresh disk, auto-formatted");
+        else              boot_tag(0, "novafs", "disk I/O error");
+    }
 
-    gfx_probe("pre-acpi");
     if (acpi_init() == 0) {
-        if (g_acpi.s5_found) boot_tag(1, "acpi", "\\_S5 found, poweroff ready");
-        else                 boot_tag(1, "acpi", "tables found");
-    } else {
+        if (!g_quiet) {
+            if (g_acpi.s5_found) boot_tag(1, "acpi", "\\_S5 found, poweroff ready");
+            else                 boot_tag(1, "acpi", "tables found");
+        }
+    } else if (!g_quiet) {
         boot_tag(0, "acpi", "tables not found");
     }
-    gfx_probe("post-acpi");
     int mse = mouse_init();
-    boot_tag(mse == 0, "input",  mse == 0 ? "keyboard + PS/2 mouse"
-                                          : "keyboard (no aux mouse)");
-    gfx_probe("post-mouse");
+    if (!g_quiet) {
+        boot_tag(mse == 0, "input",  mse == 0 ? "keyboard + PS/2 mouse"
+                                              : "keyboard (no aux mouse)");
+    }
     ring3_init(&nxp_api);
-    boot_tag(1, "ring3", "paging + TSS + IDT, user mode ready");
-    gfx_probe("post-ring3");
+    if (!g_quiet) boot_tag(1, "ring3", "paging + TSS + IDT, user mode ready");
     int net = net_init();      /* probe NIC - needs live page tables for MMIO */
-    boot_tag(net, "net", net ? "e1000 + TCP/IP stack ready"
-                             : "no NIC found (network off)");
+    if (!g_quiet) boot_tag(net, "net", net ? "e1000 + TCP/IP stack ready"
+                                           : "no NIC found (network off)");
     nxp_api.scr_w = gfx_active() ? (uint32_t)(gfx_cols() * 8) : 0;
     nxp_api.scr_h = gfx_active() ? (uint32_t)(gfx_rows() * 16) : 0;
     ring3_setup_tramp();                       /* syscall stubs, once */

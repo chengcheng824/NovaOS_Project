@@ -74,9 +74,16 @@ shot "shot3_files_back"
 
 rawkey "2" 1500; shot "shot4_tasks"                  # Tasks panel
 rawkey "3" 1500; shot "shot5_system"                 # System panel
-rawkey "1" 1500                                      # back to Files
-rawkey "q" 1500                                      # quit the TUI
-shot "shot6_shell"                                   # shell restored
+rawkey "4" 1500; shot "shot6_settings"               # Settings panel
+rawkey "right" 1000; shot "shot7_settings_green"     # accent = green (global)
+rawkey "down" 400                                    # Quiet boot row
+rawkey "right" 1000                                  # quiet on (saved + sysop 18)
+rawkey "q" 1200                                      # exit TUI -> kernel shell
+shot "shot8_prompt_green"                            # kernel prompt now green
+sk "reboot"                                          # reboot: quiet boot kicks in
+Start-Sleep -Seconds 14
+shot "shot9_quiet_login"                             # login prompt only, no banner
+sk "root"; sk "nova"; Start-Sleep -Seconds 1
 
 $b = [Text.Encoding]::ASCII.GetBytes("quit`n")
 $s.Write($b, 0, $b.Length)
@@ -84,7 +91,7 @@ Start-Sleep -Seconds 2
 $c.Close()
 if (-not $proc.HasExited) { $proc.Kill() }
 
-foreach ($n in @('shot1_files','shot2_viewer','shot3_files_back','shot4_tasks','shot5_system','shot6_shell')) {
+foreach ($n in @('shot1_files','shot2_viewer','shot3_files_back','shot4_tasks','shot5_system','shot6_settings','shot7_settings_green','shot8_prompt_green','shot9_quiet_login')) {
     $ppm = "build\$n.ppm"
     if (Test-Path $ppm) {
         & powershell -NoProfile -ExecutionPolicy Bypass -File tests\ppm2png.ps1 -In $ppm -Out "build\$n.png"

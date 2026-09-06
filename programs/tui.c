@@ -24,21 +24,47 @@
  * ============================================================ */
 #include "nxp.h"
 
-/* ---- theme (VGA attribute bytes: fg | bg<<4) ---- */
+/* ---- theme (VGA attribute bytes: fg | bg<<4) ----
+ * The accent is user-configurable (Settings panel), so accent-colored
+ * attrs come from acc()/acc_sel() instead of constants. */
 #define A_APP    NXP_ATTR(NXP_COLOR_WHITE,   NXP_COLOR_BLACK)   /* header brand */
 #define A_HDR    NXP_ATTR(NXP_COLOR_LGRAY,   NXP_COLOR_BLACK)   /* clock / user */
 #define A_RULE   NXP_ATTR(NXP_COLOR_DGRAY,   NXP_COLOR_BLACK)   /* chrome/frame */
 #define A_TABON  NXP_ATTR(NXP_COLOR_WHITE,   NXP_COLOR_DGRAY)   /* active pill  */
 #define A_TABOFF NXP_ATTR(NXP_COLOR_DGRAY,   NXP_COLOR_BLACK)
-#define A_TITLE  NXP_ATTR(NXP_COLOR_LCYAN,   NXP_COLOR_BLACK)   /* panel title  */
 #define A_TXT    NXP_ATTR(NXP_COLOR_LGRAY,   NXP_COLOR_BLACK)
-#define A_DIR    NXP_ATTR(NXP_COLOR_LCYAN,   NXP_COLOR_BLACK)
 #define A_DIM    NXP_ATTR(NXP_COLOR_DGRAY,   NXP_COLOR_BLACK)
 #define A_SEL    NXP_ATTR(NXP_COLOR_WHITE,   NXP_COLOR_DGRAY)   /* selected row */
-#define A_SELACC NXP_ATTR(NXP_COLOR_LCYAN,   NXP_COLOR_DGRAY)
 #define A_OK     NXP_ATTR(NXP_COLOR_LGREEN,  NXP_COLOR_BLACK)
 #define A_WARN   NXP_ATTR(NXP_COLOR_YELLOW,  NXP_COLOR_BLACK)
 #define A_ERR    NXP_ATTR(NXP_COLOR_LRED,    NXP_COLOR_BLACK)
+#define A_VIEW   NXP_ATTR(NXP_COLOR_LGRAY,   NXP_COLOR_BLACK)
+
+/* ---- settings (persisted to nova.cfg - the GLOBAL config the kernel
+ * also reads at boot: accent recolors the shell, quiet hides the
+ * banner/self-test; the rest are TUI-only) ---- */
+static int s_accent;    /* 0 cyan 1 green 2 yellow 3 magenta 4 white  */
+static int s_quiet;    /* 0 off 1 on (global: no banner/self-test)    */
+static int s_preview;   /* 0 auto 1 on 2 off                          */
+static int s_clock;     /* 0 show 1 hide                              */
+static int s_human;     /* 0 bytes 1 human (7.6K)                     */
+static int s_selbar;    /* 0 row highlight 1 accent bar               */
+static int s_sel;       /* selected row in the Settings panel         */
+
+static const char *acc_names[5] = { "cyan", "green", "yellow", "magenta", "white" };
+static const u8    acc_fg[5]    = { NXP_COLOR_LCYAN, NXP_COLOR_LGREEN, NXP_COLOR_YELLOW,
+                                     NXP_COLOR_LMAGENTA, NXP_COLOR_WHITE };
+static const char *quiet_names[2] = { "off", "on" };
+static u32 acc(void)     { return NXP_ATTR(acc_fg[s_accent], NXP_COLOR_BLACK); }
+static u32 acc_sel(void) { return NXP_ATTR(acc_fg[s_accent], NXP_COLOR_DGRAY); }
+
+static int WIDE;        /* COLS >= 100: preview pane possible at all  */
+static int prev_eff(void)
+{
+    if (s_preview == 1) return 1;
+    if (s_preview == 2 || !WIDE) return 0;
+    return 1;                                   /* auto */
+}
 
 /* ---- layout (computed at start) ---- */
 #define VIEW_MAX 3072                    /* viewer cap; keeps frames < 4KB */
@@ -68,6 +94,9 @@ static int  t_n, t_sel;
 static void preview_draw(void);
 static void view_file(const char *name);
 static const char *keys_hint(int tab);
+static void layout(void);
+static void draw_screen(void);
+static void settings_key(int c);
 
 /* ---- generic helpers ---- */
 static int mini(int a, int b) { return a < b ? a : b; }
@@ -111,7 +140,7 @@ static void panel(int x, int y, int w, int h, const char *title)
     API->putcell(x + w - 1, y, NXP_CH_TR_S, A_RULE);
     API->putcell(x, y + h - 1, NXP_CH_BL_S, A_RULE);
     API->putcell(x + w - 1, y + h - 1, NXP_CH_BR_S, A_RULE);
-    if (title && title[0]) API->cputs(x + 2, y, title, A_TITLE);
+    if (title && title[0]) API->cputs(x + 2, y, title, acc());
 }
 
 /* vertical scrollbar: dim ░ track, cyan █ thumb */
@@ -125,18 +154,19 @@ static void scrollbar(int x, int y, int h, int total, int top, int vis)
     for (int r = 0; r < h; r++) {
         int inthumb = (r >= tpos && r < tpos + thumb);
         API->putcell(x, y + r, inthumb ? NXP_CH_BLOCK : NXP_CH_SHADE,
-                     inthumb ? A_TITLE : A_RULE);
+                     inthumb ? acc() : A_RULE);
     }
 }
 
 /* ============================ header/status ============================ */
-static const char *tab_name[3] = { " 1 Files ", " 2 Tasks ", " 3 System " };
+static const char *tab_name[4] = { " 1 Files ", " 2 Tasks ", " 3 System ", " 4 Settings " };
 
 static const char *keys_hint(int tab)
 {
-    if (tab == 0) return "enter open   bksp up   1-3 panels   q quit";
-    if (tab == 1) return "up/down pick   k kill   1-3 panels   q quit";
-    return "1-3 panels   q quit";
+    if (tab == 0) return "enter open   bksp up   1-4 panels   q quit";
+    if (tab == 1) return "up/down pick   k kill   1-4 panels   q quit";
+    if (tab == 2) return "1-4 panels   q quit";
+    return "up/down select   left/right change   q quit";
 }
 
 static void draw_bar(void)
@@ -145,13 +175,13 @@ static void draw_bar(void)
     API->cellfill(0, 0, COLS, 1, ((u32)' ' << 8) | A_TXT);
     API->cputs(1, 0, "NovaOS", A_APP);
 
-    TABX0 = COLS / 2 - 16;
+    TABX0 = COLS / 2 - 22;
     if (TABX0 < 12) TABX0 = 12;
-    for (int t = 0; t < 3; t++)
+    for (int t = 0; t < 4; t++)
         API->cputs(TABX0 + t * 11, 0, tab_name[t],
                    (t == g_tab) ? A_TABON : A_TABOFF);
 
-    if (API->getdate(db, (u32)sizeof db) > 0) {
+    if (s_clock == 0 && API->getdate(db, (u32)sizeof db) > 0) {
         for (int i = 0; db[i]; i++) {
             if (db[i] == 'T' && db[i+1] == 'i' && db[i+2] == 'm' && db[i+3] == 'e') {
                 const char *tm = db + i + 6;
@@ -176,6 +206,154 @@ static void draw_status(void)
         while (ub[len] && len < 14) len++;
         puts_right(COLS - 2, ROWS - 1, ub, A_HDR);
     }
+}
+
+/* ============================== Settings ============================= */
+static const char *prev_names[3]  = { "auto", "on", "off" };
+static const char *clock_names[2] = { "show", "hide" };
+static const char *size_names[2]  = { "bytes", "human" };
+static const char *sel_names[2]   = { "row", "bar" };
+
+static int str_eq(const char *a, const char *b)
+{
+    while (*a && *a == *b) { a++; b++; }
+    return (*a == 0 && *b == 0);
+}
+
+static void cfg_set(const char *k, const char *v)
+{
+    if (str_eq(k, "accent")) {
+        for (int i = 0; i < 5; i++) if (str_eq(v, acc_names[i])) s_accent = i;
+    } else if (str_eq(k, "quiet")) {
+        for (int i = 0; i < 2; i++) if (str_eq(v, quiet_names[i])) s_quiet = i;
+    } else if (str_eq(k, "preview")) {
+        for (int i = 0; i < 3; i++) if (str_eq(v, prev_names[i])) s_preview = i;
+    } else if (str_eq(k, "clock")) {
+        for (int i = 0; i < 2; i++) if (str_eq(v, clock_names[i])) s_clock = i;
+    } else if (str_eq(k, "sizes")) {
+        for (int i = 0; i < 2; i++) if (str_eq(v, size_names[i])) s_human = i;
+    } else if (str_eq(k, "selection")) {
+        for (int i = 0; i < 2; i++) if (str_eq(v, sel_names[i])) s_selbar = i;
+    }
+}
+
+static void load_settings(void)
+{
+    char buf[256];                              /* stack: syscall buffer */
+    s_accent = 0; s_quiet = 0; s_preview = 0; s_clock = 0; s_human = 0; s_selbar = 0;
+    int sz = API->readfile("nova.cfg", (unsigned char *)buf, (u32)sizeof buf - 1);
+    if (sz <= 0) return;
+    buf[sz] = 0;
+    char *p = buf;
+    while (*p) {
+        char *line = p;
+        while (*p && *p != '\n') p++;
+        if (*p) *p++ = 0;
+        char *eq = line;
+        while (*eq && *eq != '=') eq++;
+        if (!*eq) continue;
+        *eq = 0;
+        cfg_set(line, eq + 1);
+    }
+}
+
+static void save_settings(void)
+{
+    char buf[192];                              /* stack: syscall buffer */
+    char *e = buf;
+    e = put_str(e, "accent=");   e = put_str(e, acc_names[s_accent]);   e = put_str(e, "\n");
+    e = put_str(e, "quiet=");    e = put_str(e, quiet_names[s_quiet]);  e = put_str(e, "\n");
+    e = put_str(e, "preview=");  e = put_str(e, prev_names[s_preview]); e = put_str(e, "\n");
+    e = put_str(e, "clock=");    e = put_str(e, clock_names[s_clock]);  e = put_str(e, "\n");
+    e = put_str(e, "sizes=");    e = put_str(e, size_names[s_human]);   e = put_str(e, "\n");
+    e = put_str(e, "selection=");e = put_str(e, sel_names[s_selbar]);   e = put_str(e, "\n");
+    *e = 0;
+    API->writefile("nova.cfg", (unsigned char *)buf, (u32)(e - buf));
+}
+
+/* "464 B" / "7.6 K" */
+static void fmt_size(char *out, u32 v)
+{
+    if (!s_human || v < 1024) {
+        char *e = put_num(out, v);
+        e = put_str(e, " B"); *e = 0;
+        return;
+    }
+    char *e = put_num(out, v / 1024);
+    *e++ = '.';
+    *e++ = (char)('0' + (v % 1024) * 10 / 1024);
+    e = put_str(e, " K"); *e = 0;
+}
+
+static void settings_apply(int delta)
+{
+    switch (s_sel) {
+    case 0:
+        s_accent = (s_accent + delta + 5) % 5;
+        break;
+    case 1:
+        s_quiet = (s_quiet + 1) % 2;            /* takes effect next boot */
+        break;
+    case 2:
+        s_preview = (s_preview + delta + 3) % 3;
+        layout();
+        break;
+    case 3:
+        s_clock = (s_clock + 1) % 2;
+        break;
+    case 4:
+        s_human = (s_human + 1) % 2;
+        break;
+    default:
+        s_selbar = (s_selbar + 1) % 2;
+        break;
+    }
+    save_settings();
+    API->sysop(18, "");                         /* kernel re-reads nova.cfg */
+    draw_screen();
+}
+
+static void settings_key(int c)
+{
+    if (c == NXP_KEY_UP && s_sel > 0) { s_sel--; draw_screen(); }
+    else if (c == NXP_KEY_DOWN && s_sel < 5) { s_sel++; draw_screen(); }
+    else if (c == NXP_KEY_LEFT || c == '-')  settings_apply(-1);
+    else if (c == NXP_KEY_RIGHT || c == '+') settings_apply(1);
+}
+
+static void settings_draw(void)
+{
+    panel(LX, LY, CW, LH, " Settings ");
+    static const char *labels[6] = { "Accent", "Quiet boot", "Preview pane",
+                                     "Header clock", "Size format", "Selection" };
+    int rowsy = LY + 2;
+    for (int i = 0; i < 6; i++) {
+        int rowy = rowsy + i * 2;
+        int sel = (i == s_sel);
+        API->cellfill(LX + 1, rowy, CW - 2, 1, ((u32)' ' << 8) | A_TXT);
+        API->cputs(LX + 4, rowy, labels[i], sel ? A_SEL : A_TXT);
+
+        const char *val = (i == 0) ? acc_names[s_accent]
+                        : (i == 1) ? quiet_names[s_quiet]
+                        : (i == 2) ? prev_names[s_preview]
+                        : (i == 3) ? clock_names[s_clock]
+                        : (i == 4) ? size_names[s_human]
+                                   : sel_names[s_selbar];
+        char pill[28];
+        char *e = put_str(pill, "[ ");
+        e = put_str(e, val);
+        if (i == 1 && s_quiet) e = put_str(e, " (next boot)");
+        if (i == 2 && !WIDE) e = put_str(e, " (n/a)");
+        e = put_str(e, " ]"); *e = 0;
+        /* the accent row doubles as a color swatch */
+        API->cputs(LX + 22, rowy, pill, (i == 0) ? acc() : (sel ? A_SEL : A_TXT));
+        if (sel) {
+            API->cputs(LX + 20, rowy, "<", A_DIM);
+            API->cputs(LX + 23 + str_len(pill), rowy, ">", A_DIM);
+        }
+    }
+    API->cputs(LX + 3, LY + LH - 2,
+               "accent + quiet are global (kernel reads nova.cfg)", A_DIM);
 }
 
 /* =============================== Files =============================== */
@@ -241,17 +419,18 @@ static void files_draw(void)
         int idx = f_top + i;
         int sel = (idx == f_sel);
         int rowy = rowsy + i;
+        int bar = (sel && s_selbar);            /* accent-bar selection */
         API->cellfill(LX + 1, rowy, LW - 2, 1,
-                      ((u32)' ' << 8) | (sel ? A_SEL : A_TXT));
-        API->putcell(LX + 2, rowy,
-                     f_dir[idx] ? NXP_CH_RARROW : NXP_CH_DOT,
-                     sel ? A_SELACC : (f_dir[idx] ? A_DIR : A_DIM));
+                      ((u32)' ' << 8) | (sel ? (bar ? A_TXT : A_SEL) : A_TXT));
+        if (bar) API->putcell(LX + 2, rowy, NXP_CH_BLOCK, acc());
+        else API->putcell(LX + 2, rowy,
+                          f_dir[idx] ? NXP_CH_RARROW : NXP_CH_DOT,
+                          sel ? acc_sel() : (f_dir[idx] ? acc() : A_DIM));
         API->cputs(LX + 4, rowy, f_name[idx],
-                   sel ? A_SEL : (f_dir[idx] ? A_DIR : A_TXT));
+                   sel ? A_SEL : (f_dir[idx] ? acc() : A_TXT));
         if (!f_dir[idx]) {
             char num[12];
-            char *pe = put_num(num, f_size[idx]);
-            *pe++ = ' '; *pe++ = 'B'; *pe = 0;
+            fmt_size(num, f_size[idx]);
             puts_right(LX + LW - 4, rowy, num, sel ? A_SEL : A_DIM);
         }
     }
@@ -262,7 +441,7 @@ static void files_draw(void)
 /* preview pane for the selected entry */
 static void preview_draw(void)
 {
-    if (!PREVIEW_ON) return;
+    if (!prev_eff()) return;
     panel(RX, RY, RW, RH, " Preview ");
 
     if (!f_n) { API->cputs(RX + 3, RY + 2, "nothing selected", A_DIM); return; }
@@ -271,7 +450,7 @@ static void preview_draw(void)
         char b[48];
         char *e = put_str(b, f_name[f_sel]);
         e = put_str(e, " - directory"); *e = 0;
-        API->cputs(RX + 3, RY + 2, b, A_DIR);
+        API->cputs(RX + 3, RY + 2, b, acc());
         char cnt[16];
         char *ce = put_num(cnt, (u32)f_n);
         *ce = 0;
@@ -499,7 +678,7 @@ static void view_file(const char *name)
 
     for (;;) {
         panel(vx, vy, w, h, " ");
-        API->cputs(vx + 2, vy, name, A_TITLE);
+        API->cputs(vx + 2, vy, name, acc());
         int line = 0, off = 0, drawn = 0;
         while (off < sz && drawn < vis) {
             int lb2 = 0;
@@ -540,6 +719,13 @@ static void view_file(const char *name)
     }
 }
 
+static void layout(void)
+{
+    LW = prev_eff() ? 58 : (COLS - 4);
+    RX = LX + LW + 2;
+    RW = COLS - RX - 2;
+}
+
 /* ============================== main ================================= */
 static void draw_screen(void)
 {
@@ -548,7 +734,8 @@ static void draw_screen(void)
     CW = (g_tab == 0) ? LW : (COLS - 4);
     if (g_tab == 0) { files_load(); files_draw(); }
     else if (g_tab == 1) { tasks_load(); tasks_draw(); }
-    else sys_draw();
+    else if (g_tab == 2) sys_draw();
+    else settings_draw();
     draw_status();
 }
 
@@ -556,16 +743,15 @@ void nxp_main(void)
 {
     COLS = API->scr_w ? (int)(API->scr_w / 8) : 80;
     ROWS = API->scr_h ? (int)(API->scr_h / 16) : 25;
-    PREVIEW_ON = (COLS >= 100);
+    WIDE = (COLS >= 100);
 
+    API->fsop(5, "/");                          /* cfg lives in the root */
     LX = 2; LY = 3;
-    LW = PREVIEW_ON ? 58 : (COLS - 4);
     LH = ROWS - 7;                              /* header 2 + status 2 + gap */
-    if (PREVIEW_ON) {
-        RX = LX + LW + 2;
-        RW = COLS - RX - 2;
-        RY = LY; RH = LH;
-    }
+    RY = LY; RH = LH;
+
+    load_settings();                            /* nova.cfg (defaults if new) */
+    layout();
 
     g_tab = 0;
     f_sel = f_top = f_n = 0;
@@ -588,9 +774,10 @@ void nxp_main(void)
             continue;
         }
         if (c == 'q' || c == 'Q' || c == 27) break;
-        if (c == '1' || c == NXP_KEY_LEFT)       { g_tab = 0; draw_screen(); }
-        else if (c == '2')                       { g_tab = 1; draw_screen(); }
-        else if (c == '3' || c == NXP_KEY_RIGHT) { g_tab = 2; draw_screen(); }
+        if (c >= '1' && c <= '4') { g_tab = c - '1'; layout(); draw_screen(); }
+        else if (g_tab == 3) settings_key(c);
+        else if (c == NXP_KEY_LEFT)  { g_tab = (g_tab + 3) % 4; layout(); draw_screen(); }
+        else if (c == NXP_KEY_RIGHT) { g_tab = (g_tab + 1) % 4; layout(); draw_screen(); }
         else if (g_tab == 0) files_key(c);
         else if (g_tab == 1) tasks_key(c);
     }
