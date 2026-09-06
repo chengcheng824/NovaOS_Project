@@ -247,13 +247,16 @@ static uint32_t g_stub_addr[SYS_COUNT];
 /* ---- accept only pointers inside the CALLING process's memory ----
  * The address space is shared, so this check IS the process isolation:
  * a syscall may touch its own slot image (+BSS), its own stack window,
- * or the shared trampoline page - never another process's memory. */
+ * or the shared trampoline page - never another process's memory.
+ * The image window is 32KB (slots are 128KB apart, so this can never
+ * reach a neighbour) - tui.nxp's BSS sits past the old 8KB line and its
+ * listdir/readfile buffers would be silently rejected otherwise. */
 static uint32_t uptr(uint32_t p)
 {
     if (p >= NXP_TRAMP_BASE && p < NXP_TRAMP_BASE + 0x1000u) return p;
     if (g_cur < 0) return 0;
     uint32_t b = slot_base[g_cur];
-    if (p >= b && p < b + 0x2000u) return p;            /* image + BSS  */
+    if (p >= b && p < b + 0x8000u) return p;            /* image + BSS  */
     uint32_t t = slot_stack[g_cur];
     if (p >= t - 0x8000u && p < t) return p;            /* stack window */
     return 0;

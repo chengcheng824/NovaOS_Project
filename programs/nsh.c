@@ -341,6 +341,8 @@ static int exec_line(char *l, int silent)
     if (str_eq(cmd, "dhcp"))     { API->sysop(14, ""); return 0; }
     if (str_eq(cmd, "dns"))      { if (!*args) { ps("dns NAME\n"); return 0; }
                                    API->sysop(15, args); return 0; }
+    if (str_eq(cmd, "wget"))     { if (!*args) { ps("wget HOST[:PORT] [/PATH]\n"); return 0; }
+                                   API->sysop(17, args); return 0; }
     if (str_eq(cmd, "udpecho"))  { API->sysop(16, ""); return 0; }
     if (str_eq(cmd, "logout"))   { API->exit(); return 0; }
 
@@ -375,7 +377,7 @@ static int exec_line(char *l, int silent)
         ps(" help ver about echo X cls date whoami mem exit logout\n"
            " ls cd mkdir rmdir rd rm cat write format fsinfo mkdemo\n"
            " useradd userdel su passwd acpi reboot shutdown halt\n"
-           " netinfo dhcp ping IP dns NAME udpecho\n"
+           " netinfo dhcp ping IP dns NAME wget H[/PATH] udpecho\n"
            " run F.nsh/.nxp  procs fg kill N  pause  set N=V  if goto\n"
            " .nsh: @line rem :: echo on|off %N%\n");
         return 0;

@@ -1,6 +1,6 @@
 # NovaOS
 
-一个简洁的 32 位 C 语言操作系统内核，带 **多用户登录**（开机认证 + 密码哈希 + 文件属主权限）、**Ring3 用户态**（分页 + TSS + IDT + int 0x80 syscall）、**抢占式多进程**（PIT 100Hz + Ring3-only 抢占 + 4 进程槽）、**.nsh 批处理脚本**（.bat 兼容语法，内核/Ring3 双引擎）、交互式 shell `NovaSh`（方向键行内编辑）、**NovaFS**（256 inode / 多级目录 / 间接块 67KB 文件 / 递归删除 / 磁盘用量统计）、**运行时 ACPI/AML 解析关机**、**Bochs VBE 图形驱动（1024x768x32 真彩控制台）**、**e1000 网卡 + TCP/IP 网络栈**（DHCP / ICMP ping / DNS / UDP echo）、**全屏 TUI**（`tui.nxp`：文件浏览器 / 任务监视 / 系统信息三面板）、**贪吃蛇**（第一个原生游戏）、**Windows BSOD 风格红屏崩溃页** 与美化启动画面，可用 QEMU 直接启动测试。（建议使用 QEMU 6.2，支持最好）
+一个简洁的 32 位 C 语言操作系统内核，带 **多用户登录**（开机认证 + 密码哈希 + 文件属主权限）、**Ring3 用户态**（分页 + TSS + IDT + int 0x80 syscall）、**抢占式多进程**（PIT 100Hz + Ring3-only 抢占 + 4 进程槽）、**.nsh 批处理脚本**（.bat 兼容语法，内核/Ring3 双引擎）、交互式 shell `NovaSh`（方向键行内编辑）、**NovaFS**（256 inode / 多级目录 / 间接块 67KB 文件 / 递归删除 / 磁盘用量统计）、**运行时 ACPI/AML 解析关机**、**Bochs VBE 图形驱动（1024x768x32 真彩控制台）**、**e1000 网卡 + TCP/IP 网络栈**（DHCP / ICMP ping / DNS / UDP echo / **TCP + wget**）、**全屏 TUI**（`tui.nxp`：文件浏览器 / 任务监视 / 系统信息三面板）、**贪吃蛇**（第一个原生游戏）、**Windows BSOD 风格红屏崩溃页** 与美化启动画面，可用 QEMU 直接启动测试。（建议使用 QEMU 6.2，支持最好）
 
 ## 目录结构
 
@@ -175,6 +175,7 @@ Welcome, root. Type 'help' for commands.
 | `dhcp`      | （重新）获取 DHCP 租约                                   |
 | `ping IP`   | 发 4 个 ICMP echo，逐包显示时延                          |
 | `dns NAME`  | DNS A 记录查询（SLIRP 转发给宿主机解析器）               |
+| `wget H[/P]`| HTTP GET（TCP），响应体按路径名存入 NovaFS，可 `cat`     |
 | `udpecho`   | UDP echo 服务器（端口 7777），按 `q` 停止                |
 
 ### 目录操作
@@ -491,48 +492,56 @@ NovaOS 内置 **e1000 网卡驱动 + 精简 TCP/IP 栈**（`kernel/e1000.c` + `k
   （P|RW|PCD|PS，VA==PA，描述符地址直接喂 DMA）。legacy 收发环：TX 8 项 / RX 16 项
   × 2KB 缓冲。MAC 先试 EERD（QEMU 语义：地址<<2、DONE=bit1），失败回落 RA0
 - **协议栈**：ARP（8 项缓存 + 应答别人的请求）→ IPv4 → ICMP echo / UDP
-  （DHCP、DNS、echo 服务）。**仅支持链路层直达目标** —— QEMU user 网络就是
-  一个 /24，10.0.2.x 全部直达，所以日常够用；没有经网关的路由转发，没有 TCP
+  （DHCP、DNS、echo 服务）/ **TCP**（精简客户端，见下）。**仅支持链路层直达
+  目标** —— QEMU user 网络就是一个 /24，10.0.2.x 全部直达，所以日常够用；
+  没有经网关的路由转发
 - **DHCP**：标准 DISCOVER→OFFER→REQUEST→ACK。细节坑：拿到 OFFER 后**立即**
   用租约 IP 应答 ARP（`g_ip` 先行、`g_ip_set` 仍为 0）—— SLIRP 对已知客户端的
   ACK/再次 OFFER 都要**先 ARP 再单投**，不应答 ARP 就永远收不到包
 - **ICMP**：内核会回应 echo request（宿主机可 ping 10.0.2.15），`ping` 命令发 4 个
   echo 并按 id/seq 匹配回复
+- **TCP**：单连接客户端状态机（SYN 握手 / 顺序收流 / 累积 ACK / FIN 关闭，
+  每段 500ms 重传）。接收环 16KB，**只 ACK 实际装入环的字节**，装不下的靠对端
+  重传（首次实现无条件推进 ACK 序号，12KB 响应丢了 3.8KB——TCP 的背压就是这么
+  来的）；收发窗口固定 4096，SLIRP 永远追不上环。`wget` 是它唯一的用户
 - **UDP echo 服务器**：7777 端口，配合 `run.ps1` 的 `hostfwd=udp::7777-:7777`，
   宿主机往 `127.0.0.1:7777` 发 UDP 会被 guest 原样回显（跨机链路验证）
 
-`nsh.nxp` 里同名命令经 `sysop` 操作码 12–16（netinfo/ping/dhcp/dns/udpecho）走
-同一份内核实现，Ring3 与内核行为完全一致。
+`nsh.nxp` 里同名命令经 `sysop` 操作码 12–17（netinfo/ping/dhcp/dns/udpecho/wget）
+走同一份内核实现，Ring3 与内核行为完全一致。
 
 ### QEMU 侧接线（run.ps1 已配好）
 
 - `-nic user,model=e1000,hostfwd=udp::7777-:7777`：用户态网络 + 7777 端口前送
 - `-monitor tcp:127.0.0.1:4444,server,nowait`：宿主机可连 QEMU 监视器（自动化用）
-- `build\nettest.ps1`：无头启动 + 监视器 `sendkey` 驱动登录 → netinfo → ping →
+- `tests\nettest.ps1`：无头启动 + 监视器 `sendkey` 驱动登录 → netinfo → ping →
   dns → udpecho + 宿主机 UDP 回环，读 `serial-nettest.log` 逐项判定；用临时数据盘
-  `data-nettest.img`，**不碰 data.img**。`build\nshtest.ps1` 额外验证 nsh.nxp 路径
+  `data-nettest.img`，**不碰 data.img**。`tests\nshtest.ps1` 额外验证 nsh.nxp 路径，
+  `tests\wgettext.ps1`（配 `tests\httphost.ps1` 宿主机 HTTP 服务器）端到端验证
+  TCP/wget
 
 ### 已知限制
 
-- 无 TCP、无 IP 分片重组、无网关路由（目标必须在链路上）
+- TCP 为单连接客户端（无并发、无服务端、无 IP 分片重组）；无网关路由（目标必须在链路上）
 - UDP 校验和恒为 0（IPv4 允许）；DNS 只取第一条 A 记录（CNAME 跳过）
-- `net_poll` 只在 ping/dhcp/dns/udpecho 等命令的等待循环里被调用，
+- `net_poll` 只在 ping/dhcp/dns/wget/udpecho 等命令的等待循环里被调用，
   没有后台收包；RX 环 16 帧，burst 超过会丢
 
 ## TUI
 
-`run tui.nxp` 进入全屏字符界面（Ring3 进程，shell 挂起，F11/F12 照常可用）。
+`run tui.nxp` 进入全屏字符界面（Ring3 进程，shell 挂起，F11/F12 照常可用），
+现代暗色主题：近黑背景、暗灰细边框、青色点缀、胶囊页签、图标化列表
+（`►` 目录 / `·` 文件）、右对齐暗灰尺寸列、`░/█` 滚动条、暗灰选中行。
 三个面板，`1/2/3` 或 `←/→` 切换，`q`/ESC 退出：
 
 | 面板      | 内容与按键                                                          |
 |-----------|----------------------------------------------------------------------|
-| `1 Files` | NovaFS 浏览器：`↑/↓` 选择，`Enter` 进目录 / 查看文件（黑底查看器，`↑/↓` 滚动，任意键返回），`Backspace` 回上级 |
-| `2 Tasks` | 进程列表每秒刷新；`↑/↓` 选择，`k` 结束选中进程（拒绝杀 TUI 自己）    |
+| `1 Files` | NovaFS 浏览器 + **实时预览面板**（右侧，选中即显示带行号的文本预览；NXP 二进制识别后显示摘要和运行提示；屏幕 <100 列时自动隐藏）。`↑/↓` 选择，`Enter` 进目录 / 全屏查看文件（`↑/↓` 滚动，任意键返回），`Backspace` 回上级 |
+| `2 Tasks` | 进程列表每秒刷新（`●` 状态点：绿=就绪、黄=挂起）；`↑/↓` 选择，`k` 结束选中进程（拒绝杀 TUI 自己）    |
 | `3 System`| 当前用户 / RTC 日期时间 / 开机时长 / 屏幕规格（128x48 LFB 或 80x25 VGA）|
 
-界面为经典 DOS 风格：灰色顶栏 + 页签高亮 + 右侧实时时钟、蓝色双线框面板、
-红色选中行、灰色状态栏（按键提示 + 当前用户）。两个控制台后端都支持：
-VBE LFB（128x48）与 80x25 VGA 文本后备，尺寸自适应（`scr_w=0` 即按 80x25）。
+两个控制台后端都支持：VBE LFB（128x48 双栏）与 80x25 VGA 文本后备（单栏），
+尺寸自适应（`scr_w=0` 即按 80x25）。
 
 实现要点（想写自己的 TUI 程序照抄即可）：
 - 内核只提供 4 个编元寻址 syscall（putcell / cellfill / cputs / cursor，见
@@ -545,9 +554,43 @@ VBE LFB（128x48）与 80x25 VGA 文本后备，尺寸自适应（`scr_w=0` 即�
   出），所以 no-op `__chkstk_ms` 必须写成 C 函数放在 `nxp_entry` 之后
 - 坑 2：MinGW 对 >4KB 栈帧插入 `__chkstk_ms` 探针；用户栈全部实体映射、
   无 guard page，`ret` 空实现即可（或像 tui.c 一样把栈帧压在 4KB 内）
-- 坑 3：syscall 缓冲的 uptr 窗口只有镜像前 8KB + 32KB 栈窗，大缓冲放栈上
-- 视觉回归：`build\tuitest.ps1`（无头启动 + 监视器 sendkey 驱动 + QEMU
-  `screendump` 截屏，`build\ppm2png.ps1` 转 PNG 人工/自动检查）
+- 坑 3：syscall 缓冲的 uptr 窗口是**槽位镜像前 32KB**（tui 的 BSS 在镜像后段，
+  旧版 8KB 窗口会把 listdir/readfile 的指针静默拒绝——文件名全部画不出来）
+- 视觉回归：`tests\tuitest.ps1`（无头启动 + 监视器 sendkey 驱动 + QEMU
+  `screendump` 截屏，`tests\ppm2png.ps1` 转 PNG 人工/自动检查）
+
+## 工具与测试脚本
+
+非临时脚本放 `tools\`（实用工具）和 `tests\`（自动化回归）；`build\` 只放
+构建产物和测试产生的临时文件，不进 git。
+
+### tools\inject.ps1 —— 向现有 NovaFS 盘非破坏式注入程序
+
+`data.img` 只在第一次从 `data-seed.img` 播种，之后 build 更新了 `programs\`
+**旧的 data.img 里不会有新程序**（表现为 `run xxx.nxp` 报 no such file）。
+过去只能删 `data.img` 重新播种（账户和文件全丢）；注入器可以原地解决：
+
+```powershell
+tools\inject.ps1 -Image data.img -Programs tui,nsh    # 自动备份 -> data.img.bak
+```
+
+- 对每个名字注入 4 个槽位二进制（`build\nxp_名0.bin` → `名.nxp` …），
+  同名文件原地覆盖（保留 inode 和属主 uid），新名字分配新 inode
+- 直接块 + 间接块都会正确释放/重建，不动其他任何文件
+- 想彻底重置仍然可以删 `data.img` 让 `run.ps1` 重新播种
+
+### tests\ —— 自动化回归（全部无头运行，不碰 data.img）
+
+| 脚本              | 内容                                                       |
+|-------------------|------------------------------------------------------------|
+| `nettest.ps1`     | 登录 → netinfo(DHCP) → ping → dns → udpecho + 宿主机 UDP 回环 |
+| `nshtest.ps1`     | nsh.nxp 里走 sysop 的同名网络命令                          |
+| `wgettext.ps1`    | 配 `httphost.ps1`（宿主机 8080 HTTP 服务器），端到端验证 TCP/wget 并 `cat` 回读 |
+| `tuitest.ps1`     | 驱动 TUI 三个面板 + 文件查看器，`screendump` 截屏逐屏检查   |
+| `ppm2png.ps1`     | QEMU 截屏 (PPM) 转 PNG 的小工具                            |
+
+测试用临时数据盘 `data-nettest.img`（由 `data-seed.img` 复制），产物
+`serial-nettest.log` / `build\shot*.ppm` 均为临时文件。
 
 ## 常见流程示例
 

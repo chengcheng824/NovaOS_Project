@@ -107,6 +107,9 @@ typedef struct {
 #define NXP_CH_H_S   0xC4   /* ─ */
 #define NXP_CH_V_S   0xB3   /* │ */
 #define NXP_CH_BLOCK 0xDB   /* █ */
+#define NXP_CH_SHADE 0xB0   /* ░ (scrollbar track) */
+#define NXP_CH_BULLET 0x07  /* ● */
+#define NXP_CH_DOT   0xFA   /* · */
 #define NXP_CH_LARROW 0x11
 #define NXP_CH_RARROW 0x10
 #define NXP_CH_UARROW 0x18

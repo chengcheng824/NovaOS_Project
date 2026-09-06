@@ -626,6 +626,7 @@ static void cmd_help(void)
     set_color(C_LCYAN); vga_puts("  dhcp    "); reset_color(); kputs("(re)request an IP via DHCP\n");
     set_color(C_LCYAN); vga_puts("  ping IP "); reset_color(); kputs("send 4 ICMP echoes\n");
     set_color(C_LCYAN); vga_puts("  dns NAME"); reset_color(); kputs("resolve a hostname\n");
+    set_color(C_LCYAN); vga_puts("  wget H "); reset_color(); kputs("HTTP GET -> NovaFS file\n");
     set_color(C_LCYAN); vga_puts("  udpecho "); reset_color(); kputs("UDP echo server :7777 (q stops)\n");
     set_color(C_LCYAN); vga_puts("  ls      "); reset_color(); kputs("list current directory\n");
     set_color(C_LCYAN); vga_puts("  cd D    "); reset_color(); kputs("change directory (.. / /)\n");
@@ -969,7 +970,7 @@ static int nxp_api_fsop(uint32_t op, const char *name)
 
 /* system ops by opcode: 1=useradd 2=userdel 3=passwd 4=su 5=mkdemo
  * 6=acpi 7=reboot 8=shutdown 9=halt 10=fg(resume all) 11=kill pid
- * 12=netinfo 13=ping 14=dhcp 15=dns 16=udpecho */
+ * 12=netinfo 13=ping 14=dhcp 15=dns 16=udpecho 17=wget */
 static int nxp_api_sysop(uint32_t op, const char *name)
 {
     switch (op) {
@@ -991,6 +992,7 @@ static int nxp_api_sysop(uint32_t op, const char *name)
     case 14: cmd_net_dhcp();    return 0;
     case 15: cmd_net_dns(name); return 0;
     case 16: cmd_net_udpecho(); return 0;
+    case 17: cmd_wget(name);    return 0;
     default: return -1;
     }
 }
@@ -1557,6 +1559,7 @@ static void process_cmd(void) {
     else if (str_eq(cmd, "dhcp"))  cmd_net_dhcp();
     else if (str_eq(cmd, "ping"))  cmd_net_ping(args);
     else if (str_eq(cmd, "dns"))   cmd_net_dns(args);
+    else if (str_eq(cmd, "wget"))  cmd_wget(args);
     else if (str_eq(cmd, "udpecho"))cmd_net_udpecho();
     else { kputs("Unknown command: "); kputs(cmd); kputs("  (try 'help')\n"); }
 }

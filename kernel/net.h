@@ -16,11 +16,12 @@
 int  net_init(void);
 int  net_present(void);
 
-/* shell commands (also reachable from nsh.nxp via sysop ops 12-16) */
+/* shell commands (also reachable from nsh.nxp via sysop ops 12-17) */
 void cmd_netinfo(void);
 void cmd_net_dhcp(void);
 void cmd_net_ping(const char *args);
 void cmd_net_dns(const char *args);
 void cmd_net_udpecho(void);
+void cmd_wget(const char *args);      /* wget HOST[:PORT] [/PATH] */
 
 #endif

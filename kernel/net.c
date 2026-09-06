@@ -203,6 +203,7 @@ static int arp_resolve(uint32_t ip, uint8_t *out)
 /* ---------------- IPv4 ---------------- */
 static void icmp_in(const uint8_t *p, uint32_t len, uint32_t src);
 static void udp_in(const uint8_t *p, uint32_t len, uint32_t src);
+static void tcp_in(const uint8_t *p, uint32_t len, uint32_t src);
 
 static void ip_in(const uint8_t *p, uint32_t len)
 {
@@ -220,6 +221,7 @@ static void ip_in(const uint8_t *p, uint32_t len)
     if (!mine && !dhcp_ok) return;
 
     if (proto == 1)  icmp_in(p + ihl, tot - ihl, src);
+    if (proto == 6)  tcp_in(p + ihl, tot - ihl, src);
     if (proto == 17) udp_in(p + ihl, tot - ihl, src);
 }
 
@@ -598,18 +600,28 @@ void cmd_net_ping(const char *args)
     kputs("--- "); pr_dec((uint32_t)got); kputs("/4 received ---\n");
 }
 
+/* quiet A-record lookup via the configured DNS server; 0 = ok */
+static int dns_resolve(const char *name, uint32_t *out)
+{
+    if (!net_ok) return -1;
+    if (!g_dns) g_dns = 0x0A000203u;                  /* QEMU user-net DNS */
+    dns_done = 0; dns_a = 0;
+    if (dns_query(name) != 0) return -1;
+    uint32_t t0 = proc_ticks();
+    while (!dns_done && proc_ticks() - t0 < 600) net_poll();
+    if (!dns_done) return -1;
+    *out = dns_a;
+    return 0;
+}
+
 void cmd_net_dns(const char *args)
 {
     if (!net_ok) { kputs("dns: no NIC\n"); return; }
     if (!args || !*args) { kputs("dns NAME\n"); return; }
     net_ensure_ip();
-    if (!g_dns) g_dns = 0x0A000203u;                  /* QEMU user-net DNS */
-    dns_done = 0; dns_a = 0;
-    dns_query(args);
-    uint32_t t0 = proc_ticks();
-    while (!dns_done && proc_ticks() - t0 < 600) net_poll();
-    if (!dns_done) { kputs("dns: no reply\n"); return; }
-    kputs(args); kputs(" -> "); pr_ip(dns_a); kput('\n');
+    uint32_t ip;
+    if (dns_resolve(args, &ip) != 0) { kputs("dns: no reply\n"); return; }
+    kputs(args); kputs(" -> "); pr_ip(ip); kput('\n');
 }
 
 void cmd_net_udpecho(void)
@@ -623,4 +635,331 @@ void cmd_net_udpecho(void)
         if (c == 'q' || c == 'Q' || c == 27) break;
     }
     kputs("UDP echo off\n");
+}
+
+/* ---------------- TCP (minimal client, ONE connection) ----------------
+ * Just enough for HTTP: SYN handshake, in-order payload, cumulative
+ * ACKs, FIN close, a 500 ms retransmit timer. A single TCB - the shell
+ * is single-threaded and wget is its only user. rcv window is kept at
+ * 4 KB so SLIRP never outruns the 8 KB receive ring between polls. */
+#define TCP_FIN 0x01
+#define TCP_SYN 0x02
+#define TCP_RST 0x04
+#define TCP_PSH 0x08
+#define TCP_ACK 0x10
+
+#define TCPST_CLOSED   0
+#define TCPST_SYN_SENT 1
+#define TCPST_ESTAB    2
+#define TCPST_FIN_SENT 3          /* our FIN is out, want the last ACK */
+#define TCPST_DEAD     4          /* RST, handshake timeout, or done    */
+
+static struct {
+    uint8_t  used, state, fin_rx;
+    uint32_t rip;
+    uint16_t rport, lport;
+    uint32_t snd_nxt;             /* next seq we will send            */
+    uint32_t snd_acked;           /* highest ackn the peer returned   */
+    uint32_t rcv_nxt;             /* next seq we expect from peer     */
+    uint32_t fin_end;             /* seq past the peer's FIN          */
+} tcb;
+
+static uint8_t tcp_rbuf[16384];   /* received stream (ring)           */
+static volatile uint16_t tcp_rh, tcp_rt;
+
+static uint32_t tcp_rpush(const uint8_t *p, uint32_t n)
+{
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        uint16_t nx = (uint16_t)((tcp_rh + 1) % sizeof tcp_rbuf);
+        if (nx == tcp_rt) break;  /* ring full: leave unacked, peer retries */
+        tcp_rbuf[tcp_rh] = p[i];
+        tcp_rh = nx;
+    }
+    return i;
+}
+
+static uint32_t tcp_rpop(uint8_t *out, uint32_t max)
+{
+    uint32_t n = 0;
+    while (tcp_rt != tcp_rh && n < max) {
+        out[n++] = tcp_rbuf[tcp_rt];
+        tcp_rt = (uint16_t)((tcp_rt + 1) % sizeof tcp_rbuf);
+    }
+    return n;
+}
+
+/* checksum over the TCP segment plus the IPv4 pseudo header */
+static uint16_t tcp_cksum(const uint8_t *h, uint32_t len)
+{
+    uint32_t s = (g_ip >> 16) + (g_ip & 0xFFFF) +
+                 (tcb.rip >> 16) + (tcb.rip & 0xFFFF) + 6 + len;
+    for (uint32_t i = 0; i + 1 < len; i += 2) s += (uint32_t)h[i] << 8 | h[i + 1];
+    if (len & 1) s += (uint32_t)h[len - 1] << 8;
+    while (s >> 16) s = (s & 0xFFFF) + (s >> 16);
+    return (uint16_t)~s;
+}
+
+static uint8_t tcp_seg[1536];
+
+static int tcp_tx(uint8_t flags, const uint8_t *payload, uint32_t len,
+                  uint32_t seq, uint32_t ackn)
+{
+    if (len > 1400) return -1;
+    uint8_t *p = tcp_seg;
+    st16(p, tcb.lport); st16(p + 2, tcb.rport);
+    st32(p + 4, seq); st32(p + 8, ackn);
+    p[12] = 0x50;                              /* data offset: 5 words */
+    p[13] = flags;
+    st16(p + 14, 4096);                        /* receive window       */
+    st16(p + 16, 0); st16(p + 18, 0);
+    for (uint32_t i = 0; i < len; i++) p[20 + i] = payload[i];
+    st16(p + 16, tcp_cksum(p, 20 + len));
+    return ip_send(tcb.rip, 6, p, (uint16_t)(20 + len));
+}
+
+static void tcp_in(const uint8_t *p, uint32_t len, uint32_t src)
+{
+    if (len < 20) return;
+    if (!tcb.used || src != tcb.rip) return;
+    uint16_t dp = ld16(p + 2);
+    if (dp != tcb.lport) return;
+    uint32_t seq = ld32(p + 4), ackn = ld32(p + 8);
+    uint32_t doff = (uint32_t)(p[12] >> 4) * 4;
+    uint8_t  fl = p[13];
+    if (doff < 20 || doff > len) return;
+    const uint8_t *pay = p + doff;
+    uint32_t plen = len - doff;
+
+    if (fl & TCP_RST) { tcb.state = TCPST_DEAD; return; }
+
+    if (tcb.state == TCPST_SYN_SENT) {
+        if ((fl & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK) &&
+            ackn == tcb.snd_nxt) {             /* our SYN is acked     */
+            tcb.rcv_nxt = seq + 1;             /* peer SYN consumes 1  */
+            tcb.snd_acked = tcb.snd_nxt = ackn;
+            tcp_tx(TCP_ACK, 0, 0, tcb.snd_nxt, tcb.rcv_nxt);
+            tcb.state = TCPST_ESTAB;
+        }
+        return;
+    }
+
+    if ((fl & TCP_ACK) && (int32_t)(ackn - tcb.snd_acked) > 0)
+        tcb.snd_acked = ackn;
+
+    if (plen > 0) {
+        /* accept only what fits in the ring and ack exactly that much;
+         * the peer retransmits whatever we did not acknowledge (a
+         * retransmit may overlap the already-acked prefix) */
+        uint32_t take = 0;
+        if (seq == tcb.rcv_nxt) {
+            take = tcp_rpush(pay, plen);
+        } else if ((int32_t)(seq - tcb.rcv_nxt) < 0 &&
+                   (int32_t)(seq + plen - tcb.rcv_nxt) > 0) {
+            uint32_t skip = tcb.rcv_nxt - seq;
+            take = tcp_rpush(pay + skip, plen - skip);
+        }
+        tcb.rcv_nxt += take;
+        tcp_tx(TCP_ACK, 0, 0, tcb.snd_nxt, tcb.rcv_nxt);
+    }
+
+    if (fl & TCP_FIN) {
+        if (!tcb.fin_rx) tcb.fin_end = seq + plen + 1;
+        tcb.fin_rx = 1;
+        if (seq + plen + 1 == tcb.rcv_nxt)
+            tcp_tx(TCP_ACK, 0, 0, tcb.snd_nxt, tcb.rcv_nxt);
+    }
+
+    if (tcb.state == TCPST_FIN_SENT && (fl & TCP_ACK) && ackn == tcb.snd_nxt)
+        tcb.state = TCPST_DEAD;
+}
+
+static int tcp_connect(uint32_t ip, uint16_t port)
+{
+    if (!net_ok || !g_ip_set) return -1;
+    if (tcb.used) return -1;
+
+    tcb.used = 1; tcb.fin_rx = 0; tcb.fin_end = 0;
+    tcb.rip = ip; tcb.rport = port;
+    tcb.lport = (uint16_t)(0xC000 + (proc_ticks() & 0x1FFF));
+    tcb.snd_nxt = proc_ticks() * 1103515245u + 12345u;
+    tcb.snd_acked = 0; tcb.rcv_nxt = 0;
+    tcp_rh = tcp_rt = 0;
+    tcb.state = TCPST_SYN_SENT;
+
+    tcp_tx(TCP_SYN, 0, 0, tcb.snd_nxt, 0);
+    tcb.snd_nxt++;                             /* SYN consumes one seq */
+    uint32_t t0 = proc_ticks(), t1 = t0;
+    while (proc_ticks() - t0 < 500) {          /* 5 s handshake budget */
+        net_poll();
+        if (tcb.state == TCPST_ESTAB) return 0;
+        if (tcb.state == TCPST_DEAD) { tcb.used = 0; return -1; }
+        if (proc_ticks() - t1 >= 50) {         /* retransmit the SYN   */
+            t1 = proc_ticks();
+            tcp_tx(TCP_SYN, 0, 0, tcb.snd_nxt - 1, 0);
+        }
+    }
+    tcb.used = 0; tcb.state = TCPST_CLOSED;
+    return -1;
+}
+
+/* one segment, then wait (and retransmit) until fully acked */
+static int tcp_send_data(const uint8_t *data, uint32_t len)
+{
+    if (tcb.state != TCPST_ESTAB || len == 0 || len > 1400) return -1;
+    uint32_t seq = tcb.snd_nxt;
+    tcb.snd_nxt += len;
+    uint32_t t0 = proc_ticks(), t1 = t0;
+    int tries = 0;
+    tcp_tx(TCP_ACK | TCP_PSH, data, len, seq, tcb.rcv_nxt);
+    for (;;) {
+        net_poll();
+        if ((int32_t)(tcb.snd_acked - (seq + len)) >= 0) return (int)len;
+        if (tcb.state == TCPST_DEAD) return -1;
+        if (proc_ticks() - t0 > 500) return -1;
+        if (proc_ticks() - t1 >= 50) {         /* 500 ms retransmit    */
+            t1 = proc_ticks();
+            if (++tries > 4) return -1;
+            tcp_tx(TCP_ACK | TCP_PSH, data, len, seq, tcb.rcv_nxt);
+        }
+    }
+}
+
+/* pull from the receive ring; >0 = bytes, 0 = idle timeout or EOF,
+ * -1 = connection dead */
+static int tcp_recv(uint8_t *out, uint32_t max, uint32_t timeout)
+{
+    uint32_t t0 = proc_ticks();
+    for (;;) {
+        uint32_t n = tcp_rpop(out, max);
+        if (n) return (int)n;
+        if (tcb.state == TCPST_DEAD) return -1;
+        if (tcb.fin_rx && tcb.rcv_nxt == tcb.fin_end &&
+            tcp_rt == tcp_rh) return 0;                        /* clean EOF */
+        if (proc_ticks() - t0 >= timeout) return 0;
+        net_poll();
+    }
+}
+
+static void tcp_close(void)
+{
+    if (!tcb.used) return;
+    if (tcb.state == TCPST_ESTAB) {
+        uint32_t fseq = tcb.snd_nxt;
+        tcb.snd_nxt++;                         /* FIN consumes one seq */
+        tcp_tx(TCP_FIN | TCP_ACK, 0, 0, fseq, tcb.rcv_nxt);
+        uint32_t t0 = proc_ticks();
+        while (tcb.state == TCPST_ESTAB && proc_ticks() - t0 < 200)
+            net_poll();
+    }
+    tcb.used = 0;
+    tcb.state = TCPST_CLOSED;
+}
+
+extern int fs_write(const char *name, const uint8_t *data, uint32_t len);
+
+/* wget HOST[:PORT] [/PATH] - HTTP/1.0 GET, body saved into NovaFS */
+void cmd_wget(const char *args)
+{
+    if (!net_ok) { kputs("wget: no NIC\n"); return; }
+    if (!args || !*args) { kputs("wget HOST[:PORT] [/PATH]\n"); return; }
+    net_ensure_ip();
+    if (!g_ip_set) { kputs("wget: no IP (dhcp failed?)\n"); return; }
+
+    char host[64];
+    int hi = 0;
+    const char *s = args;
+    while (*s && *s != ' ' && *s != '/' && hi < 63) host[hi++] = *s++;
+    host[hi] = 0;
+    while (*s == ' ') s++;                       /* tolerate "host path" */
+    char path[160];
+    int pk = 0;
+    if (*s == '/') { while (*s && pk < 158) path[pk++] = *s++; }
+    else if (*s) { path[pk++] = '/'; while (*s && pk < 158) path[pk++] = *s++; }
+    else path[pk++] = '/';
+    path[pk] = 0;
+    if (!hi) { kputs("wget: no host\n"); return; }
+
+    uint16_t port = 80;
+    char *colon = 0;
+    for (int i = 0; host[i]; i++) if (host[i] == ':') colon = host + i;
+    if (colon) {
+        uint32_t v = 0;
+        const char *q = colon + 1;
+        while (*q >= '0' && *q <= '9') v = v * 10 + (uint32_t)(*q++ - '0');
+        if (*q || !v || v > 65535) { kputs("wget: bad port\n"); return; }
+        port = (uint16_t)v;
+        *colon = 0;
+    }
+
+    uint32_t ip;
+    if (!parse_ip(host, &ip) && dns_resolve(host, &ip) != 0) {
+        kputs("wget: cannot resolve host\n");
+        return;
+    }
+
+    kputs("wget: connect "); pr_ip(ip); kput(':'); pr_dec(port); kput('\n');
+    if (tcp_connect(ip, port) != 0) { kputs("wget: no SYN-ACK\n"); return; }
+
+    static char req[384];
+    char *e = req;
+    {   /* build the request head */
+        const char *l;
+        l = "GET ";       while (*l) *e++ = *l++;
+        l = path;         while (*l && e - req < 200) *e++ = *l++;
+        l = " HTTP/1.0\r\nHost: "; while (*l && e - req < 240) *e++ = *l++;
+        l = host;         while (*l && e - req < 300) *e++ = *l++;
+        l = "\r\nUser-Agent: NovaOS\r\nConnection: close\r\n\r\n";
+        while (*l && e - req < 380) *e++ = *l++;
+        *e = 0;
+    }
+    if (tcp_send_data((const uint8_t *)req, (uint32_t)(e - req)) < 0) {
+        kputs("wget: send failed\n");
+        tcp_close();
+        return;
+    }
+
+    static uint8_t resp[16384];
+    uint32_t total = 0, t0 = proc_ticks();
+    for (;;) {
+        int n = tcp_recv(resp + total, (uint32_t)sizeof resp - total, 300);
+        if (n > 0) {
+            total += (uint32_t)n;
+            t0 = proc_ticks();
+            if (total >= sizeof resp) break;   /* buffer full */
+        } else if (n < 0) break;               /* reset / dead */
+        else if (tcb.fin_rx && tcb.rcv_nxt == tcb.fin_end &&
+                 tcp_rt == tcp_rh) break;      /* whole stream is here */
+        else if (total && proc_ticks() - t0 >= 150) break;   /* 1.5s idle */
+        else if (!total && proc_ticks() - t0 >= 600) break;  /* 6s no data */
+    }
+    tcp_close();
+
+    if (!total) { kputs("wget: no data\n"); return; }
+
+    uint32_t hlen = 0;
+    while (hlen + 4 <= total &&
+           !(resp[hlen] == '\r' && resp[hlen + 1] == '\n' &&
+             resp[hlen + 2] == '\r' && resp[hlen + 3] == '\n')) hlen++;
+    if (hlen + 4 > total) hlen = total;
+    kputs("HTTP: ");
+    for (uint32_t i = 0; i < hlen && resp[i] >= ' '; i++) kput((char)resp[i]);
+    kput('\n');
+
+    uint32_t boff = (hlen + 4 <= total) ? hlen + 4 : total;
+    uint32_t blen = total - boff;
+    if (!blen) { kputs("wget: empty body\n"); return; }
+
+    char name[24];
+    const char *last = path;
+    for (const char *q = path; *q; q++) if (*q == '/') last = q + 1;
+    int nk = 0;
+    while (last[nk] && last[nk] != '?' && nk < 23) name[nk] = last[nk], nk++;
+    name[nk] = 0;
+    if (!name[0]) { name[0]='i'; name[1]='n'; name[2]='d'; name[3]='e'; name[4]='x';
+                    name[5]='.'; name[6]='h'; name[7]='t'; name[8]='m'; name[9]=0; }
+
+    kputs("wget: "); pr_dec(blen); kputs(" B body -> ");
+    if (fs_write(name, resp + boff, blen) >= 0) { kputs(name); kput('\n'); }
+    else kputs("(fs write failed)\n");
 }
