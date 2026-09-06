@@ -14,7 +14,9 @@ Step gcc ($cc + @('-c','-I',$KERNEL,"$KERNEL\novafs.c","-o","$BUILD\novafs.o")) 
 Step gcc ($cc + @('-c','-I',$KERNEL,"$KERNEL\acpi.c","-o","$BUILD\acpi.o")) 'acpi.c'
 Step gcc ($cc + @('-c','-I',$KERNEL,"$KERNEL\gfx.c","-o","$BUILD\gfx.o")) 'gfx.c'
 Step gcc ($cc + @('-c','-I',$KERNEL,"$KERNEL\paging.c","-o","$BUILD\paging.o")) 'paging.c'
-Step ld @('-m','i386pe','-Ttext','0x100000','--file-alignment','16','--section-alignment','16','-o',"$BUILD\kernel.elf","$BUILD\entry.o","$BUILD\kernel.o","$BUILD\ata.o","$BUILD\novafs.o","$BUILD\acpi.o","$BUILD\gfx.o","$BUILD\paging.o") 'Link'
+Step gcc ($cc + @('-c','-I',$KERNEL,"$KERNEL\e1000.c","-o","$BUILD\e1000.o")) 'e1000.c'
+Step gcc ($cc + @('-c','-I',$KERNEL,"$KERNEL\net.c","-o","$BUILD\net.o")) 'net.c'
+Step ld @('-m','i386pe','-Ttext','0x100000','--file-alignment','16','--section-alignment','16','-o',"$BUILD\kernel.elf","$BUILD\entry.o","$BUILD\kernel.o","$BUILD\ata.o","$BUILD\novafs.o","$BUILD\acpi.o","$BUILD\gfx.o","$BUILD\paging.o","$BUILD\e1000.o","$BUILD\net.o") 'Link'
 Step objcopy @('-O','binary','-j','.text','-j','.rdata','-j','.data',"$BUILD\kernel.elf","$BUILD\kernel.bin") 'objcopy'
 $binsize=(Get-Item "$BUILD\kernel.bin").Length
 Write-Host ("    kernel.bin = {0} bytes"-f $binsize)-ForegroundColor Gray

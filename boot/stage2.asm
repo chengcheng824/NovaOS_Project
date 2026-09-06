@@ -4,11 +4,15 @@
 [bits 16]
 [org 0x8000]
 %include "kernel_entry.inc"
+; NOTE: the %ifndef guard below is ALWAYS taken - `equ` symbols from
+; kernel_entry.inc are not preprocessor macros, so %ifndef can't see
+; them and these %defines silently win. Keep KERNEL_BIN_BYTES in sync
+; with stage1's KERNEL_SECS budget (LBA 3..128 = 126 sectors = 0xFC00
+; bytes); build.ps1 enforces the same limit on kernel.bin.
 %ifndef KERNEL_ENTRY_VMA
   %define KERNEL_IMG_BASE    0x00100000
   %define KERNEL_ENTRY_VMA   0x00100240
-  ; must match stage1's KERNEL_SECS budget (LBA 3..82 = 80 sectors = 40 KiB)
-  %define KERNEL_BIN_BYTES   0x0000A000
+  %define KERNEL_BIN_BYTES   0x0000FC00
 %endif
 COM1 equ 0x3F8
 TMP  equ  0x00008400

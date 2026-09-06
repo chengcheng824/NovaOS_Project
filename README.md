@@ -1,6 +1,6 @@
 # NovaOS
 
-一个简洁的 32 位 C 语言操作系统内核，带 **多用户登录**（开机认证 + 密码哈希 + 文件属主权限）、**Ring3 用户态**（分页 + TSS + IDT + int 0x80 syscall）、**抢占式多进程**（PIT 100Hz + Ring3-only 抢占 + 4 进程槽）、**.nsh 批处理脚本**（.bat 兼容语法，内核/Ring3 双引擎）、交互式 shell `NovaSh`（方向键行内编辑）、**NovaFS**（256 inode / 多级目录 / 间接块 67KB 文件 / 递归删除 / 磁盘用量统计）、**运行时 ACPI/AML 解析关机**、**Bochs VBE 图形驱动（1024x768x32 真彩控制台）**、**贪吃蛇**（第一个原生游戏）、**Windows BSOD 风格红屏崩溃页** 与美化启动画面，可用 QEMU 直接启动测试。（建议使用 QEMU 6.2，支持最好）
+一个简洁的 32 位 C 语言操作系统内核，带 **多用户登录**（开机认证 + 密码哈希 + 文件属主权限）、**Ring3 用户态**（分页 + TSS + IDT + int 0x80 syscall）、**抢占式多进程**（PIT 100Hz + Ring3-only 抢占 + 4 进程槽）、**.nsh 批处理脚本**（.bat 兼容语法，内核/Ring3 双引擎）、交互式 shell `NovaSh`（方向键行内编辑）、**NovaFS**（256 inode / 多级目录 / 间接块 67KB 文件 / 递归删除 / 磁盘用量统计）、**运行时 ACPI/AML 解析关机**、**Bochs VBE 图形驱动（1024x768x32 真彩控制台）**、**e1000 网卡 + TCP/IP 网络栈**（DHCP / ICMP ping / DNS / UDP echo）、**贪吃蛇**（第一个原生游戏）、**Windows BSOD 风格红屏崩溃页** 与美化启动画面，可用 QEMU 直接启动测试。（建议使用 QEMU 6.2，支持最好）
 
 ## 目录结构
 
@@ -18,6 +18,8 @@ NovaOS/
 │   ├── novafs.c / novafs.h   # NovaFS 文件系统: 多级目录 + 递归删除 + 磁盘用量统计
 │   ├── acpi.c / acpi.h     # 最小 ACPI/AML 解析器 (RSDP→FADT→DSDT, 解析 \_S5 关机)
 │   ├── gfx.c / gfx.h       # Bochs VBE 图形驱动: 1024x768x32 真彩控制台 (128x48)
+│   ├── e1000.c / e1000.h   # Intel 82540EM (QEMU e1000) 网卡驱动: PCI 扫描 + 轮询收发环
+│   ├── net.c / net.h       # 精简 TCP/IP 栈: ARP/IPv4/ICMP/UDP + DHCP/DNS/echo 命令
 │   ├── stdint.h            # 最小 stdint
 │   └── link.ld             # 链接脚本 (段紧凑于 0x100000)
 ├── programs/               # Ring3 用户程序源码 (build 自动编译注入)
@@ -31,7 +33,7 @@ NovaOS/
 │   ├── hello.nsh           # 第一个脚本：变量 / 回显 / pause
 │   └── count.nsh           # if/goto 循环倒数 3-2-1
 ├── build.ps1  build.bat    # 构建脚本 (NASM + gcc + ld + objcopy -> disk.img + data-seed.img)
-├── run.ps1    run.bat      # QEMU 启动脚本 (双盘: 引导盘 + 数据盘, isa-debug-exit + 串口日志)
+├── run.ps1    run.bat      # QEMU 启动脚本 (双盘 + e1000 user 网络 + 7777 hostfwd + 监视器 4444 + 串口日志)
 └── README.md
 ```
 
@@ -93,7 +95,7 @@ QEMU 启动后：
 1. Stage1 (0x7C00) INT 13h LBA 分两段加载 Stage2 + 内核（避开 64K 边界）
 2. Stage2 开 A20 / 设 GDT / 切保护模式，把内核从 0x8400 拷贝到 0x00100000，`jmp 0x08:0x100000`
 3. `entry.asm` 设置 SS/DS/ES/FS/GS = 0x10，栈顶 0x00200000，调用 C 的 `kmain`
-4. 横幅 → 启动自检（cpu/video/com1/novafs/acpi/input/ring3）→ **登录提示** → NovaSh
+4. 横幅 → 启动自检（cpu/video/com1/novafs/acpi/input/ring3/net）→ **登录提示** → NovaSh
 
 提示：
 - 用户数据在独立的 `data.img`（IDE 从盘）上：重新 build 不丢账户/文件；删掉 `data.img` 再运行即从模板重置（内置程序也会回来）
@@ -163,6 +165,16 @@ Welcome, root. Type 'help' for commands.
 | `procs`    | 列出进程（`ps` 同义）；`s`=挂起 `r`=就绪 |
 | `fg`       | 恢复全部挂起的进程                    |
 | `kill N`   | 结束进程 N（不带 N = 结束全部）       |
+
+### 网络
+
+| 命令        | 说明                                                     |
+|-------------|----------------------------------------------------------|
+| `netinfo`   | NIC / MAC / IP / 掩码 / 网关 / DNS；未配置时自动跑 DHCP  |
+| `dhcp`      | （重新）获取 DHCP 租约                                   |
+| `ping IP`   | 发 4 个 ICMP echo，逐包显示时延                          |
+| `dns NAME`  | DNS A 记录查询（SLIRP 转发给宿主机解析器）               |
+| `udpecho`   | UDP echo 服务器（端口 7777），按 `q` 停止                |
 
 ### 目录操作
 
@@ -437,6 +449,7 @@ typedef struct {
 | Syscall Trampoline  | 0x00400000    | Ring3 R/X  | `int 0x80` stub + 0xF80 起的 API 表       |
 | 进程栈 槽0–3        | 0x500000 / 0x4C0000 / 0x480000 / 0x440000 | Ring3 R/W | 各自向下增长          |
 | Identity 页目录/表  | 0x001FF000    | 内核 R/W   | 1 PDE + 2 PT（0–8MB，identity map）       |
+| NIC MMIO (e1000)    | PCI BAR0 运行时探测 | 内核 R/W | `page_map_device()` 4MB 大页恒等映射  |
 
 ## 键盘
 
@@ -454,6 +467,45 @@ typedef struct {
 - 键盘和鼠标共用端口 `0x60`，靠状态寄存器 bit5（aux 标志）区分字节归属，统一由 `ps2_drain()` 分发
 - 3 字节包 `[flags dx dy]`，bit3 作包同步位，9 位符号扩展；PS/2 的 +y 向上已换算为屏幕 +y 向下
 - 初始化期间的命令 ACK / 配置字节**不是**包数据，只消费不进包组装器（否则会错位一整个包）
+
+## 网络
+
+NovaOS 内置 **e1000 网卡驱动 + 精简 TCP/IP 栈**（`kernel/e1000.c` + `kernel/net.c`），
+全部轮询驱动：无中断（IMS=0）、无线程，每个等待型命令在自己的循环里调 `net_poll()`
+收帧、以 `proc_ticks()`（IRQ0 的 10ms 计数）做超时。在 QEMU 用户态网络下开箱即用：
+
+- **驱动**：PCI 总线 0 扫描 `8086:100E`（QEMU 默认网卡，00:03.0），开 MEM + Bus
+  Master；MMIO BAR 由 `paging.c` 新增的 `page_map_device()` 用 **4MB 大页恒等映射**
+  （P|RW|PCD|PS，VA==PA，描述符地址直接喂 DMA）。legacy 收发环：TX 8 项 / RX 16 项
+  × 2KB 缓冲。MAC 先试 EERD（QEMU 语义：地址<<2、DONE=bit1），失败回落 RA0
+- **协议栈**：ARP（8 项缓存 + 应答别人的请求）→ IPv4 → ICMP echo / UDP
+  （DHCP、DNS、echo 服务）。**仅支持链路层直达目标** —— QEMU user 网络就是
+  一个 /24，10.0.2.x 全部直达，所以日常够用；没有经网关的路由转发，没有 TCP
+- **DHCP**：标准 DISCOVER→OFFER→REQUEST→ACK。细节坑：拿到 OFFER 后**立即**
+  用租约 IP 应答 ARP（`g_ip` 先行、`g_ip_set` 仍为 0）—— SLIRP 对已知客户端的
+  ACK/再次 OFFER 都要**先 ARP 再单投**，不应答 ARP 就永远收不到包
+- **ICMP**：内核会回应 echo request（宿主机可 ping 10.0.2.15），`ping` 命令发 4 个
+  echo 并按 id/seq 匹配回复
+- **UDP echo 服务器**：7777 端口，配合 `run.ps1` 的 `hostfwd=udp::7777-:7777`，
+  宿主机往 `127.0.0.1:7777` 发 UDP 会被 guest 原样回显（跨机链路验证）
+
+`nsh.nxp` 里同名命令经 `sysop` 操作码 12–16（netinfo/ping/dhcp/dns/udpecho）走
+同一份内核实现，Ring3 与内核行为完全一致。
+
+### QEMU 侧接线（run.ps1 已配好）
+
+- `-nic user,model=e1000,hostfwd=udp::7777-:7777`：用户态网络 + 7777 端口前送
+- `-monitor tcp:127.0.0.1:4444,server,nowait`：宿主机可连 QEMU 监视器（自动化用）
+- `build\nettest.ps1`：无头启动 + 监视器 `sendkey` 驱动登录 → netinfo → ping →
+  dns → udpecho + 宿主机 UDP 回环，读 `serial-nettest.log` 逐项判定；用临时数据盘
+  `data-nettest.img`，**不碰 data.img**。`build\nshtest.ps1` 额外验证 nsh.nxp 路径
+
+### 已知限制
+
+- 无 TCP、无 IP 分片重组、无网关路由（目标必须在链路上）
+- UDP 校验和恒为 0（IPv4 允许）；DNS 只取第一条 A 记录（CNAME 跳过）
+- `net_poll` 只在 ping/dhcp/dns/udpecho 等命令的等待循环里被调用，
+  没有后台收包；RX 环 16 帧，burst 超过会丢
 
 ## 常见流程示例
 

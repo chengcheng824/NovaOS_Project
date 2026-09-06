@@ -335,6 +335,13 @@ static int exec_line(char *l, int silent)
     if (str_eq(cmd, "fg"))       { API->sysop(10, ""); ps("resumed\n"); return 0; }
     if (str_eq(cmd, "kill"))     { if (!*args) { ps("kill N\n"); return 0; }
                                    API->sysop(11, args); return 0; }
+    if (str_eq(cmd, "netinfo"))  { API->sysop(12, ""); return 0; }
+    if (str_eq(cmd, "ping"))     { if (!*args) { ps("ping IP\n"); return 0; }
+                                   API->sysop(13, args); return 0; }
+    if (str_eq(cmd, "dhcp"))     { API->sysop(14, ""); return 0; }
+    if (str_eq(cmd, "dns"))      { if (!*args) { ps("dns NAME\n"); return 0; }
+                                   API->sysop(15, args); return 0; }
+    if (str_eq(cmd, "udpecho"))  { API->sysop(16, ""); return 0; }
     if (str_eq(cmd, "logout"))   { API->exit(); return 0; }
 
     /* ---- local info commands ---- */
@@ -368,6 +375,7 @@ static int exec_line(char *l, int silent)
         ps(" help ver about echo X cls date whoami mem exit logout\n"
            " ls cd mkdir rmdir rd rm cat write format fsinfo mkdemo\n"
            " useradd userdel su passwd acpi reboot shutdown halt\n"
+           " netinfo dhcp ping IP dns NAME udpecho\n"
            " run F.nsh/.nxp  procs fg kill N  pause  set N=V  if goto\n"
            " .nsh: @line rem :: echo on|off %N%\n");
         return 0;

@@ -14,6 +14,11 @@
 /* one-time init: identity paging, user segments, TSS, IDT, PIC mask */
 void ring3_init(const void *api_table);
 
+/* map a device MMIO region with 4MB PDEs (supervisor, cache off);
+ * identity mapping, returns phys as VA, 0 = refused. Call after
+ * ring3_init (needs live page tables + PSE). */
+uint32_t page_map_device(uint32_t phys, uint32_t len);
+
 /* build the trampoline page (call right before entering a program) */
 void ring3_setup_tramp(void);
 

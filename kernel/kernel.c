@@ -9,6 +9,7 @@
 #include "acpi.h"
 #include "gfx.h"
 #include "paging.h"
+#include "net.h"
 
 /* ---- Port I/O ---- */
 static inline void outb(uint16_t port, uint8_t v)
@@ -341,6 +342,10 @@ static void ps2_drain(void)
 static int g_hotkey;            /* 0x57=F11 / 0x58=F12 seen while polling */
 int kb_take_hotkey(void) { int h = g_hotkey; g_hotkey = 0; return h; }
 
+/* non-blocking key read for kernel-side service loops (net.c udpecho) */
+static int kb_poll(void);
+int shell_kb_poll(void) { return kb_poll(); }
+
 /* scheduler hotkeys (paging.c irq0): consume raw make-scancode `raw`
  * from the PS/2 ring if it is pending (F11 = 0x57, F12 = 0x58) */
 int kb_take_raw(uint8_t raw)
@@ -581,6 +586,11 @@ static void cmd_help(void)
     set_color(C_LCYAN); vga_puts("  date    "); reset_color(); kputs("date and time\n");
     set_color(C_LCYAN); vga_puts("  mem     "); reset_color(); kputs("memory layout\n");
     set_color(C_LCYAN); vga_puts("  acpi    "); reset_color(); kputs("ACPI tables + \\_S5 info\n");
+    set_color(C_LCYAN); vga_puts("  netinfo "); reset_color(); kputs("NIC status (auto-dhcp)\n");
+    set_color(C_LCYAN); vga_puts("  dhcp    "); reset_color(); kputs("(re)request an IP via DHCP\n");
+    set_color(C_LCYAN); vga_puts("  ping IP "); reset_color(); kputs("send 4 ICMP echoes\n");
+    set_color(C_LCYAN); vga_puts("  dns NAME"); reset_color(); kputs("resolve a hostname\n");
+    set_color(C_LCYAN); vga_puts("  udpecho "); reset_color(); kputs("UDP echo server :7777 (q stops)\n");
     set_color(C_LCYAN); vga_puts("  ls      "); reset_color(); kputs("list current directory\n");
     set_color(C_LCYAN); vga_puts("  cd D    "); reset_color(); kputs("change directory (.. / /)\n");
     set_color(C_LCYAN); vga_puts("  mkdir D "); reset_color(); kputs("create directory\n");
@@ -891,7 +901,8 @@ static int nxp_api_fsop(uint32_t op, const char *name)
 }
 
 /* system ops by opcode: 1=useradd 2=userdel 3=passwd 4=su 5=mkdemo
- * 6=acpi 7=reboot 8=shutdown 9=halt 10=fg(resume all) 11=kill pid */
+ * 6=acpi 7=reboot 8=shutdown 9=halt 10=fg(resume all) 11=kill pid
+ * 12=netinfo 13=ping 14=dhcp 15=dns 16=udpecho */
 static int nxp_api_sysop(uint32_t op, const char *name)
 {
     switch (op) {
@@ -908,6 +919,11 @@ static int nxp_api_sysop(uint32_t op, const char *name)
     case 11:
         return (name && name[0] >= '1' && name[0] <= '4' && name[1] == 0)
                 ? proc_kill(name[0] - '0') : -1;
+    case 12: cmd_netinfo();     return 0;
+    case 13: cmd_net_ping(name); return 0;
+    case 14: cmd_net_dhcp();    return 0;
+    case 15: cmd_net_dns(name); return 0;
+    case 16: cmd_net_udpecho(); return 0;
     default: return -1;
     }
 }
@@ -1469,6 +1485,11 @@ static void process_cmd(void) {
     else if (str_eq(cmd, "kill"))  cmd_kill(args);
     else if (str_eq(cmd, "ps"))    cmd_procs();
     else if (str_eq(cmd, "mkdemo"))cmd_mkdemo();
+    else if (str_eq(cmd, "netinfo"))cmd_netinfo();
+    else if (str_eq(cmd, "dhcp"))  cmd_net_dhcp();
+    else if (str_eq(cmd, "ping"))  cmd_net_ping(args);
+    else if (str_eq(cmd, "dns"))   cmd_net_dns(args);
+    else if (str_eq(cmd, "udpecho"))cmd_net_udpecho();
     else { kputs("Unknown command: "); kputs(cmd); kputs("  (try 'help')\n"); }
 }
 
@@ -1972,6 +1993,9 @@ void kmain(void) {
     ring3_init(&nxp_api);
     boot_tag(1, "ring3", "paging + TSS + IDT, user mode ready");
     gfx_probe("post-ring3");
+    int net = net_init();      /* probe NIC - needs live page tables for MMIO */
+    boot_tag(net, "net", net ? "e1000 + TCP/IP stack ready"
+                             : "no NIC found (network off)");
     nxp_api.scr_w = gfx_active() ? (uint32_t)(gfx_cols() * 8) : 0;
     nxp_api.scr_h = gfx_active() ? (uint32_t)(gfx_rows() * 16) : 0;
     ring3_setup_tramp();                       /* syscall stubs, once */

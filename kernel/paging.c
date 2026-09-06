@@ -588,6 +588,24 @@ static void map_init(void)
     }
 }
 
+/* map a device MMIO region with 4MB pages (supervisor, RW, cache off)
+ * into unused PDE slots; identity-style so VA == PA. Call AFTER paging
+ * is live (ring3_init); returns phys as the VA to use, 0 if PSE is off
+ * or the region would clash with an existing mapping. */
+uint32_t page_map_device(uint32_t phys, uint32_t len)
+{
+    if (!len) return 0;
+    uint32_t first = phys >> 22;
+    uint32_t last  = (phys + len - 1) >> 22;
+    if (last > 1023 || last - first > 1) return 0;    /* 2 PDEs is plenty */
+    for (uint32_t i = first; i <= last; i++)
+        if (pde[i]) return 0;                         /* slot taken */
+    for (uint32_t i = first; i <= last; i++)
+        pde[i] = ((uint32_t)i << 22) | 0x93;          /* P|RW|PCD|PS */
+    __asm__ volatile ("mov %0, %%cr3" : : "r"(PDE_ADDR));   /* flush TLB */
+    return phys;
+}
+
 /* ---- PIC remap + PIT @100Hz + IRQ0 gate: the preemption heart ----
  * Runs at the very end of ring3_init. Only IRQ0 is unmasked; keyboard,
  * mouse and disks stay polled exactly as before. */
