@@ -151,6 +151,41 @@ static void reset_color(void)
     vga_bg = C_BLACK;
 }
 
+/* ---- cell-addressed console ops (TUI primitives) ----
+ * attr = VGA attribute byte (fg | bg<<4). Works on both backends:
+ * the VBE LFB console renders via gfx_cell (per-cell colors, no
+ * cursor/scroll side effects), the 80x25 fallback writes VGA_MEM. */
+void con_put(int x, int y, char ch, uint8_t attr)
+{
+    if (x < 0 || y < 0) return;
+    if (gfx_active()) { gfx_cell(x, y, ch, attr & 0x0F, (attr >> 4) & 0x0F); return; }
+    if (x >= VGA_COLS || y >= VGA_ROWS) return;
+    VGA_MEM[y * VGA_COLS + x] = ((uint16_t)attr << 8) | (uint8_t)ch;
+}
+
+void con_fill(int x, int y, int w, int h, char ch, uint8_t attr)
+{
+    for (int r = 0; r < h; r++)
+        for (int c = 0; c < w; c++)
+            con_put(x + c, y + r, ch, attr);
+}
+
+/* hide/show the text-mode hardware cursor. gfx path: the LFB console has
+ * no autonomous cursor (it is only drawn by gfx_putc, which a fullscreen
+ * TUI never calls, and redraws wipe the underline), so only the VGA
+ * fallback needs real cursor control. */
+static int cursor_start = -1;
+void con_cursor(int on)
+{
+    if (gfx_active()) return;
+    if (on) {
+        if (cursor_start >= 0) { outb(0x3D4, 0x0A); outb(0x3D5, (uint8_t)cursor_start); }
+    } else {
+        if (cursor_start < 0) { outb(0x3D4, 0x0A); cursor_start = inb(0x3D5) & 0x1F; }
+        outb(0x3D4, 0x0A); outb(0x3D5, 0x20);       /* bit5 set: cursor off */
+    }
+}
+
 /* ---- Serial (COM1) ---- */
 #define COM1 0x3F8
 static inline void io_wait(void) { outb(0x80, 0); }
@@ -564,6 +599,7 @@ static void cmd_su(const char *name);
 
 static void shell_prompt(void)
 {
+    con_cursor(1);      /* a killed TUI may have hidden the hw cursor */
     fs_getcwd(cwdbuf, sizeof(cwdbuf));
     set_color(C_LCYAN); vga_puts("\n");
     set_color(C_LGREEN); vga_puts(g_cur_user);
@@ -762,6 +798,13 @@ typedef struct {
     int  (*fsop)(uint32_t op, const char *name);  /* fs ops by opcode   */
     int  (*sysop)(uint32_t op, const char *name); /* system ops by opcode */
     uint32_t (*ticks)(void);                      /* 10 ms since boot   */
+    void (*putcell)(uint32_t x, uint32_t y, uint32_t ch, uint32_t attr);
+                                                  /* TUI: write one cell */
+    void (*cellfill)(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                     uint32_t chattr);            /* chattr = ch<<8|attr */
+    void (*cputs)(uint32_t x, uint32_t y, const char *s, uint32_t attr);
+                                                  /* TUI: text at cells  */
+    void (*cursor)(uint32_t on);                  /* TUI: hide/show cursor */
 } nxp_api_t;
 
 static void nxp_api_putc(char c)              { kput(c); }
@@ -836,6 +879,30 @@ static int nxp_api_writefile(const char *name, const uint8_t *data, uint32_t len
 
 /* 10 ms since boot - the clock games and animation are built on */
 static uint32_t nxp_api_ticks(void) { return proc_ticks(); }
+
+/* ---- TUI primitives (cell-addressed console, see con_put above) ---- */
+static void nxp_api_putcell(uint32_t x, uint32_t y, uint32_t ch, uint32_t attr)
+{
+    con_put((int)x, (int)y, (char)ch, (uint8_t)attr);
+}
+static void nxp_api_cellfill(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                             uint32_t chattr)     /* chattr = ch<<8 | attr */
+{
+    if (w == 0 || h == 0) return;
+    if (w > 256) w = 256;
+    if (h > 128) h = 128;
+    con_fill((int)x, (int)y, (int)w, (int)h, (char)(chattr >> 8), (uint8_t)(chattr & 0xFF));
+}
+static void nxp_api_cputs(uint32_t x, uint32_t y, const char *s, uint32_t attr)
+{
+    if (!s) return;
+    int cx = (int)x, n = 0;
+    while (*s && n++ < 256) con_put(cx++, (int)y, *s++, (uint8_t)attr);
+}
+static void nxp_api_cursor(uint32_t on)
+{
+    con_cursor((int)on);
+}
 
 /* ---- the syscall layer reuses the shell command implementations ---- */
 static void cmd_mkdir(const char *name);
@@ -950,7 +1017,8 @@ static nxp_api_t nxp_api = {
     nxp_api_getpixel,
     nxp_api_cls, nxp_api_setcolor, nxp_api_getuser, nxp_api_getdate,
     nxp_api_readfile, nxp_api_spawn, nxp_api_procs, nxp_api_writefile,
-    nxp_api_listdir, nxp_api_fsop, nxp_api_sysop, nxp_api_ticks
+    nxp_api_listdir, nxp_api_fsop, nxp_api_sysop, nxp_api_ticks,
+    nxp_api_putcell, nxp_api_cellfill, nxp_api_cputs, nxp_api_cursor
 };
 
 /* "name.D.nxp" selects process slot D (0-3); plain "name.nxp" = slot 0 */

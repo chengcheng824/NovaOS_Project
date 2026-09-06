@@ -211,6 +211,21 @@ void gfx_blit_char(int x0, int y0, char ch, uint8_t fg_idx, int scale)
     blit_core(x0, y0, ch, pal[fg_idx & 0x0F], scale);
 }
 
+/* cell-addressed glyph with explicit per-cell colors (TUI primitives).
+ * Bypasses the text console entirely: no cursor, no scrolling. */
+void gfx_cell(int cx, int cy, char ch, uint8_t fg_idx, uint8_t bg_idx)
+{
+    if (!gfx_on || cx < 0 || cy < 0 || cx >= con_cols || cy >= con_rows) return;
+    int x0 = cx * GLYPH_W, y0 = cy * GLYPH_H;
+    const uint8_t *g = font[(uint8_t)ch];
+    uint32_t fg = pal[fg_idx & 0x0F], bg = pal[bg_idx & 0x0F];
+    for (int r = 0; r < GLYPH_H; r++) {
+        uint8_t bits = g[r];
+        for (int b = 0; b < GLYPH_W; b++)
+            px(x0 + b, y0 + r, (bits & (0x80 >> b)) ? fg : bg);
+    }
+}
+
 static void draw_cell(int cx, int cy)
 {
     /* full cell incl. background so it also erases a stale cursor */

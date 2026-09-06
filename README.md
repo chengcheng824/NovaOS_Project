@@ -1,6 +1,6 @@
 # NovaOS
 
-一个简洁的 32 位 C 语言操作系统内核，带 **多用户登录**（开机认证 + 密码哈希 + 文件属主权限）、**Ring3 用户态**（分页 + TSS + IDT + int 0x80 syscall）、**抢占式多进程**（PIT 100Hz + Ring3-only 抢占 + 4 进程槽）、**.nsh 批处理脚本**（.bat 兼容语法，内核/Ring3 双引擎）、交互式 shell `NovaSh`（方向键行内编辑）、**NovaFS**（256 inode / 多级目录 / 间接块 67KB 文件 / 递归删除 / 磁盘用量统计）、**运行时 ACPI/AML 解析关机**、**Bochs VBE 图形驱动（1024x768x32 真彩控制台）**、**e1000 网卡 + TCP/IP 网络栈**（DHCP / ICMP ping / DNS / UDP echo）、**贪吃蛇**（第一个原生游戏）、**Windows BSOD 风格红屏崩溃页** 与美化启动画面，可用 QEMU 直接启动测试。（建议使用 QEMU 6.2，支持最好）
+一个简洁的 32 位 C 语言操作系统内核，带 **多用户登录**（开机认证 + 密码哈希 + 文件属主权限）、**Ring3 用户态**（分页 + TSS + IDT + int 0x80 syscall）、**抢占式多进程**（PIT 100Hz + Ring3-only 抢占 + 4 进程槽）、**.nsh 批处理脚本**（.bat 兼容语法，内核/Ring3 双引擎）、交互式 shell `NovaSh`（方向键行内编辑）、**NovaFS**（256 inode / 多级目录 / 间接块 67KB 文件 / 递归删除 / 磁盘用量统计）、**运行时 ACPI/AML 解析关机**、**Bochs VBE 图形驱动（1024x768x32 真彩控制台）**、**e1000 网卡 + TCP/IP 网络栈**（DHCP / ICMP ping / DNS / UDP echo）、**全屏 TUI**（`tui.nxp`：文件浏览器 / 任务监视 / 系统信息三面板）、**贪吃蛇**（第一个原生游戏）、**Windows BSOD 风格红屏崩溃页** 与美化启动画面，可用 QEMU 直接启动测试。（建议使用 QEMU 6.2，支持最好）
 
 ## 目录结构
 
@@ -23,11 +23,12 @@ NovaOS/
 │   ├── stdint.h            # 最小 stdint
 │   └── link.ld             # 链接脚本 (段紧凑于 0x100000)
 ├── programs/               # Ring3 用户程序源码 (build 自动编译注入)
-│   ├── nxp.h / nxp_entry.c # .nxp API 头 (26 项) + 入口跳板
+│   ├── nxp.h / nxp_entry.c # .nxp API 头 (30 项) + 入口跳板 (+ no-op __chkstk_ms)
 │   ├── hello.c             # 静态演示 (彩条)
 │   ├── ringok.c / ringbad.c  # Ring3 健全性 / 用户态故障测试
 │   ├── paint.c             # 鼠标画板
 │   ├── snake.c             # 贪吃蛇 (第一个原生游戏)
+│   ├── tui.c               # tui.nxp: 全屏 TUI (文件浏览 / 任务 / 系统三面板)
 │   └── nsh.c               # nsh.nxp: 完整 NovaSh + .nsh 脚本引擎
 ├── scripts/                # .nsh 示例脚本 (build 注入 data-seed.img)
 │   ├── hello.nsh           # 第一个脚本：变量 / 回显 / pause
@@ -334,7 +335,18 @@ Ring3 规则：
                          用户程序第一次拥有了完整的文件读写能力
 +0x58 ticks()          ← 系统启动以来的 10 ms 计数（IRQ0 累加），
                          游戏节拍/动画定时的基准时钟
++0x5C putcell(x,y,ch,attr)  ← TUI 原语：写一个字符单元（VGA attr: fg|bg<<4）
++0x60 cellfill(x,y,w,h,chattr) ← TUI 原语：填矩形，chattr = ch<<8|attr
++0x64 cputs(x,y,s,attr)     ← TUI 原语：在单元坐标打印字符串
++0x68 cursor(on)       ← TUI 原语：隐藏/恢复文本光标
 ```
+
+TUI 原语绕过滚动控制台，直接按单元寻址：LFB 控制台由 `gfx_cell()` 逐单元渲染
+（每单元独立前景/背景色，无光标/滚动副作用），VGA 文本后备直写 0xB8000。
+`programs/nxp.h` 提供 `NXP_ATTR(fg,bg)` 与 CP437 制表符常量（╔ ═ ║ 等，
+VGA BIOS 字体自带）。注意 syscall 的用户指针只接受**调用者槽位镜像前 8KB
+或自身 32KB 栈窗** —— 传给 listdir/procs/readfile/getdate/getuser 的大缓冲
+必须放栈上（tui.c 即此写法）。
 
 方向键扩展码：`NXP_KEY_LEFT/RIGHT/UP/DOWN` = 0x11/0x12/0x13/0x14（nxp.h 有定义）。
 
@@ -506,6 +518,36 @@ NovaOS 内置 **e1000 网卡驱动 + 精简 TCP/IP 栈**（`kernel/e1000.c` + `k
 - UDP 校验和恒为 0（IPv4 允许）；DNS 只取第一条 A 记录（CNAME 跳过）
 - `net_poll` 只在 ping/dhcp/dns/udpecho 等命令的等待循环里被调用，
   没有后台收包；RX 环 16 帧，burst 超过会丢
+
+## TUI
+
+`run tui.nxp` 进入全屏字符界面（Ring3 进程，shell 挂起，F11/F12 照常可用）。
+三个面板，`1/2/3` 或 `←/→` 切换，`q`/ESC 退出：
+
+| 面板      | 内容与按键                                                          |
+|-----------|----------------------------------------------------------------------|
+| `1 Files` | NovaFS 浏览器：`↑/↓` 选择，`Enter` 进目录 / 查看文件（黑底查看器，`↑/↓` 滚动，任意键返回），`Backspace` 回上级 |
+| `2 Tasks` | 进程列表每秒刷新；`↑/↓` 选择，`k` 结束选中进程（拒绝杀 TUI 自己）    |
+| `3 System`| 当前用户 / RTC 日期时间 / 开机时长 / 屏幕规格（128x48 LFB 或 80x25 VGA）|
+
+界面为经典 DOS 风格：灰色顶栏 + 页签高亮 + 右侧实时时钟、蓝色双线框面板、
+红色选中行、灰色状态栏（按键提示 + 当前用户）。两个控制台后端都支持：
+VBE LFB（128x48）与 80x25 VGA 文本后备，尺寸自适应（`scr_w=0` 即按 80x25）。
+
+实现要点（想写自己的 TUI 程序照抄即可）：
+- 内核只提供 4 个编元寻址 syscall（putcell / cellfill / cputs / cursor，见
+  「.nxp 程序格式」），控制台路由在 `kernel.c` 的 `con_put/con_fill/con_cursor`，
+  LFB 渲染在 `gfx.c` 的 `gfx_cell()`
+- `tui.nxp` 约 5.9 KB，由 `build.ps1` 自动按 4 个槽位链接注入，开机即
+  `run tui.nxp` 可用
+- 坑 1：`.nxp` 入口 = 镜像第一个字节 —— `nxp_entry.c` 里**文件级 `__asm__`
+  会被 GCC 提到所有函数之前**，把入口顶掉（表现为程序一进 Ring3 就直接退
+  出），所以 no-op `__chkstk_ms` 必须写成 C 函数放在 `nxp_entry` 之后
+- 坑 2：MinGW 对 >4KB 栈帧插入 `__chkstk_ms` 探针；用户栈全部实体映射、
+  无 guard page，`ret` 空实现即可（或像 tui.c 一样把栈帧压在 4KB 内）
+- 坑 3：syscall 缓冲的 uptr 窗口只有镜像前 8KB + 32KB 栈窗，大缓冲放栈上
+- 视觉回归：`build\tuitest.ps1`（无头启动 + 监视器 sendkey 驱动 + QEMU
+  `screendump` 截屏，`build\ppm2png.ps1` 转 PNG 人工/自动检查）
 
 ## 常见流程示例
 

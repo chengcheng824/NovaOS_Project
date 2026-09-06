@@ -59,6 +59,7 @@ typedef struct {
     fn5 cls, set_color, getuser, getdate, readfile, spawn, procs, writefile;
     fn5 listdir, fsop, sysop;
     fn5 ticks;
+    fn5 putcell, cellfill, cputs, cursor;   /* TUI primitives (appended) */
 } kapi_t;
 static const kapi_t *g_api;
 
@@ -73,7 +74,8 @@ enum { SYS_PUTC, SYS_PUTS, SYS_GETCHAR, SYS_EXIT,
        SYS_MOUSE, SYS_GETPIXEL,
        SYS_CLS, SYS_SETCOLOR, SYS_GETUSER, SYS_GETDATE, SYS_READFILE,
        SYS_SPAWN, SYS_PROCS, SYS_WRITEFILE,
-       SYS_LISTDIR, SYS_FSOP, SYS_SYSOP, SYS_TICKS, SYS_COUNT };
+       SYS_LISTDIR, SYS_FSOP, SYS_SYSOP, SYS_TICKS,
+       SYS_PUTCELL, SYS_CELLFILL, SYS_CPUTS, SYS_CURSOR, SYS_COUNT };
 
 /* ============================================================
  * Processes: 4 fixed slots, ONE address space (no CR3 switch).
@@ -307,6 +309,10 @@ void syscall_dispatch(regs_t *r)
     case SYS_PIXEL:    g_api->pixel(a[0], a[1], a[2], 0, 0); break;
     case SYS_FILL:     g_api->fill_rect(a[0], a[1], a[2], a[3], a[4]); break;
     case SYS_TEXT:     g_api->text(a[0], a[1], uptr(a[2]), a[3], 0); break;
+    case SYS_PUTCELL:  g_api->putcell(a[0], a[1], a[2], a[3], 0); break;
+    case SYS_CELLFILL: g_api->cellfill(a[0], a[1], a[2], a[3], a[4]); break;
+    case SYS_CPUTS:    g_api->cputs(a[0], a[1], uptr(a[2]), a[3], 0); break;
+    case SYS_CURSOR:   g_api->cursor(a[0], 0, 0, 0, 0); break;
     case SYS_GETKEY:   ret = g_api->getkey(0, 0, 0, 0, 0); break;
     case SYS_MOUSE:
         ret = g_api->mouse(uptr(a[0]), uptr(a[1]), uptr(a[2]), 0, 0);
@@ -507,7 +513,8 @@ static uint8_t *emit_stub(uint8_t *p, uint32_t sysno, int nargs)
 
 void ring3_setup_tramp(void)
 {
-    static const uint8_t nargs[SYS_COUNT] = { 1,1,0,0,3,5,4,0,3,2, 0,1,2,2,3,1,2,3, 2,2,2,0 };
+    static const uint8_t nargs[SYS_COUNT] = { 1,1,0,0,3,5,4,0,3,2, 0,1,2,2,3,1,2,3, 2,2,2,0,
+                                              4,5,4,1 };
     uint8_t *p = (uint8_t *)NXP_TRAMP_BASE;
     uint32_t stub[SYS_COUNT];
 
@@ -532,6 +539,8 @@ void ring3_setup_tramp(void)
     t[20] = stub[SYS_PROCS];   t[21] = stub[SYS_WRITEFILE];
     t[22] = stub[SYS_LISTDIR]; t[23] = stub[SYS_FSOP];
     t[24] = stub[SYS_SYSOP];   t[25] = stub[SYS_TICKS];
+    t[26] = stub[SYS_PUTCELL]; t[27] = stub[SYS_CELLFILL];
+    t[28] = stub[SYS_CPUTS];   t[29] = stub[SYS_CURSOR];
 }
 
 /* ---- descriptor helpers ---- */

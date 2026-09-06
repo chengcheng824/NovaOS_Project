@@ -42,5 +42,8 @@ int  gfx_ready(void);
 void gfx_pixel(int x, int y, uint32_t rgb);
 uint32_t gfx_pixel_get(int x, int y);   /* for software cursors (XOR sprites) */
 void gfx_text(int x, int y, const char *s, uint32_t rgb);
+/* cell-addressed glyph with explicit colors (TUI); no cursor/scroll side
+ * effects. VGA attr convention: fg = attr & 0xF, bg = (attr >> 4) & 0xF */
+void gfx_cell(int cx, int cy, char ch, uint8_t fg_idx, uint8_t bg_idx);
 
 #endif

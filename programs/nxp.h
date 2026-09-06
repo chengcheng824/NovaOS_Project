@@ -52,6 +52,14 @@ typedef struct {
                                           * 4=su 5=mkdemo 6=acpi 7=reboot
                                           * 8=shutdown 9=halt 10=fg 11=kill  */
     u32  (*ticks)(void);                 /* 10 ms since boot (game timing)   */
+    /* ---- cell-addressed TUI primitives (VGA attr: fg | bg<<4) ----   */
+    void (*putcell)(u32 x, u32 y, u32 ch, u32 attr);
+                                         /* write one character cell         */
+    void (*cellfill)(u32 x, u32 y, u32 w, u32 h, u32 chattr);
+                                         /* fill a rect: chattr = ch<<8|attr */
+    void (*cputs)(u32 x, u32 y, const char *s, u32 attr);
+                                         /* print text at cell coords        */
+    void (*cursor)(u32 on);              /* hide/show the text cursor        */
 } nxp_api_t;
 
 /* set_color() foreground values (VGA attribute low nibble) */
@@ -81,6 +89,28 @@ typedef struct {
 #define NXP_KEY_RIGHT 0x12
 #define NXP_KEY_UP    0x13
 #define NXP_KEY_DOWN  0x14
+
+/* TUI helpers: VGA attribute byte = fg | bg<<4 (16-color palette) */
+#define NXP_ATTR(fg, bg)  (((bg) << 4) | (fg))
+
+/* CP437 box-drawing glyphs (present in the captured VGA 8x16 font) */
+#define NXP_CH_H     0xCD   /* ═ */
+#define NXP_CH_V     0xBA   /* ║ */
+#define NXP_CH_TL    0xC9   /* ╔ */
+#define NXP_CH_TR    0xBB   /* ╗ */
+#define NXP_CH_BL    0xC8   /* ╚ */
+#define NXP_CH_BR    0xBC   /* ╝ */
+#define NXP_CH_TL_S  0xDA   /* ┌ */
+#define NXP_CH_TR_S  0xBF   /* ┐ */
+#define NXP_CH_BL_S  0xC0   /* └ */
+#define NXP_CH_BR_S  0xD9   /* ┘ */
+#define NXP_CH_H_S   0xC4   /* ─ */
+#define NXP_CH_V_S   0xB3   /* │ */
+#define NXP_CH_BLOCK 0xDB   /* █ */
+#define NXP_CH_LARROW 0x11
+#define NXP_CH_RARROW 0x10
+#define NXP_CH_UARROW 0x18
+#define NXP_CH_DARROW 0x19
 
 extern nxp_api_t *nxp_api_ptr;   /* set by nxp_entry.c before nxp_main() */
 #define API nxp_api_ptr

@@ -11,3 +11,11 @@ void nxp_entry(void)
     __asm__ volatile ("movl %%eax, _nxp_api_ptr" : : : "memory");
     nxp_main();
 }
+
+/* MinGW emits a __chkstk_ms call for stack frames > 4KB. The real one
+ * probes pages downward (guard-page growth); our user stack is fully
+ * backed RAM and the caller still does its own `sub %eax,%esp`, so a
+ * no-op is correct. Defined as a C function AFTER nxp_entry: the first
+ * .text byte is the program entry, and top-level __asm__ would be
+ * hoisted ahead of every function (that bug shipped once already). */
+void __chkstk_ms(void) { }
