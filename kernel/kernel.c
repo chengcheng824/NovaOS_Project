@@ -677,6 +677,7 @@ static void cmd_help(void)
     set_color(g_accent); vga_puts("  cat F   "); reset_color(); kputs("show file\n");
     set_color(g_accent); vga_puts("  write F "); reset_color(); kputs("create file (end with .)\n");
     set_color(g_accent); vga_puts("  rm F    "); reset_color(); kputs("delete file\n");
+    set_color(g_accent); vga_puts("  chmod F "); reset_color(); kputs("set permissions (e.g. 64 = rw-r--)\n");
     set_color(g_accent); vga_puts("  run F   "); reset_color(); kputs("run .nsh script / start .nxp process\n");
     set_color(g_accent); vga_puts("  procs   "); reset_color(); kputs("list running processes\n");
     set_color(g_accent); vga_puts("  fg      "); reset_color(); kputs("resume suspended processes\n");
@@ -951,6 +952,7 @@ static void cmd_mkdir(const char *name);
 static void cmd_rmdir(const char *name);
 static void cmd_rd(const char *name);
 static void cmd_rm(const char *name);
+static void cmd_chmod(const char *args);
 static void cmd_cd(const char *name);
 static void cmd_format(void);
 static void cmd_fsinfo(void);
@@ -976,11 +978,27 @@ static void ls_dec(uint32_t v)
     while (v) { t[k++] = (char)('0' + v % 10); v /= 10; }
     while (k--) ls_putc(t[k]);
 }
-static void ls_collect(const char *name, int type, uint32_t size)
+/* render the mode byte as "rwxrwx" (owner nibble + others nibble) */
+static void mode_str(uint8_t mode, char *out)
 {
+    int p = 0;
+    for(int half = 0; half < 2; half++){
+        uint8_t n = half ? (uint8_t)(mode & 0xF) : (uint8_t)(mode >> 4);
+        out[p++] = (n & 4) ? 'r' : '-';
+        out[p++] = (n & 2) ? 'w' : '-';
+        out[p++] = (n & 1) ? 'x' : '-';
+    }
+    out[6] = 0;
+}
+
+static void ls_collect(const char *name, int type, uint32_t size, uint8_t mode)
+{
+    char mb[7];
+    mode_str(mode, mb);
     g_ls_n++;
     if (!g_ls_p) return;
     ls_puts(type == T_DIR ? "  [DIR]  " : "  [FILE] ");
+    ls_puts(mb); ls_putc(' ');
     ls_puts(name);
     if (type != T_FILE) { ls_putc('\n'); return; }
     ls_puts("   ("); ls_dec(size); ls_puts(" B)\n");
@@ -1027,8 +1045,12 @@ static int nxp_api_sysop(uint32_t op, const char *name)
     case 9:  cmd_halt();        return 0;
     case 10: proc_resume_all(); return 0;
     case 11:
-        return (name && name[0] >= '1' && name[0] <= '4' && name[1] == 0)
-                ? proc_kill(name[0] - '0') : -1;
+        if (name && name[0] >= '1' && name[0] <= '4' && name[1] == 0) {
+            int r = proc_kill(name[0] - '0');
+            if (r == -2) kputs("kill: permission denied (not your process)\n");
+            return r;
+        }
+        return -1;
     case 12: cmd_netinfo();     return 0;
     case 13: cmd_net_ping(name); return 0;
     case 14: cmd_net_dhcp();    return 0;
@@ -1047,7 +1069,7 @@ static int nxp_api_readfile(const char *name, uint8_t *buf, uint32_t max)
     if (!name || !buf || max == 0 || !fs_is_ready()) return -1;
     int sz = fs_size(name);
     if (sz < 0) return -1;
-    fs_read(name, buf, max);
+    if (fs_read(name, buf, max) == -2) return -1;   /* read permission denied */
     if (sz > (int)max) sz = (int)max;
     return sz;
 }
@@ -1086,6 +1108,7 @@ static int nxp_load_slot(const char *name, int slot)
     if(!fs_is_ready()){ kputs("NovaFS not formatted. Use 'format'.\n"); return -1; }
     int sz = fs_size(name);
     if(sz < 5){ kputs("run: no such file\n"); return -1; }
+    if(!fs_may_exec(name)){ kputs("run: permission denied\n"); return -1; }
     uint8_t *dst = (uint8_t *)proc_slot_base(slot);
     fs_read(name, dst, 0x1F000u);
     if(dst[0]!='N' || dst[1]!='X' || dst[2]!='P' || dst[3]!=1){
@@ -1253,6 +1276,7 @@ static void nsh_run_script(const char *file)
     if(!fs_is_ready()){ kputs("NovaFS not formatted.\n"); return; }
     int n = fs_size(file);
     if(n <= 0){ kputs("run: no such file\n"); return; }
+    if(!fs_may_read(file)){ kputs("run: permission denied\n"); return; }
     for(int i = 0; i < NSH_MAX; i++) nsh_sbuf[i] = 0;
     fs_read(file, (uint8_t*)nsh_sbuf, NSH_MAX - 1);
     nsh_in_script = 1;
@@ -1410,25 +1434,28 @@ static int g_file_count;
 
 
 
-static void ls_cb(const char *name, int type, uint32_t size)
+static void ls_cb(const char *name, int type, uint32_t size, uint8_t mode)
 {
+    char mb[7];
+    mode_str(mode, mb);
     g_file_count++;
     if(type == T_DIR){
         set_color(C_LBLUE);
-        kputs("  [DIR] ");
+        kputs("  [DIR]  ");
     }else{
         set_color(C_LGRAY);
-        kputs("  [FILE]");
+        kputs("  [FILE] ");
     }
     reset_color();
-    kput(' '); kputs(name);
+    set_color(C_DGRAY); kputs(mb); kput(' '); reset_color();
+    kputs(name);
     if(type == T_FILE){ kputs("   ("); kput_dec(size); kputs(" B)"); }
     kput('\n');
 }
 
-static void count_cb(const char *name, int type, uint32_t size)
+static void count_cb(const char *name, int type, uint32_t size, uint8_t mode)
 {
-    (void)name; (void)type; (void)size;
+    (void)name; (void)type; (void)size; (void)mode;
     g_file_count++;
 }
 
@@ -1510,7 +1537,10 @@ static void cmd_cat(const char *name)
     if(sz < 0){ kputs("No such file\n"); return; }
     if(sz > TXT_MAX) sz = TXT_MAX;
     for(int i=0;i<TXT_MAX;i++) textbuf[i]=0;
-    fs_read(name, (uint8_t*)textbuf, TXT_MAX);
+    if(fs_read(name, (uint8_t*)textbuf, TXT_MAX) == -2){
+        kputs("cat: permission denied\n");
+        return;
+    }
     for(int i=0;i<sz;i++) kput(textbuf[i]);
     if(sz>0 && textbuf[sz-1]!='\n') kput('\n');
 }
@@ -1537,6 +1567,7 @@ static void cmd_write(const char *name)
         textbuf[len++] = '\n';
     }
     int w = fs_write(name, (uint8_t*)textbuf, (uint32_t)len);
+    if(w == -2){ kputs("Write failed: permission denied (not the owner)\n"); return; }
     if(w < 0){ kputs("Write failed\n"); return; }
     kputs("Saved "); kput_dec((unsigned)w); kputs(" bytes.\n");
 }
@@ -1549,6 +1580,34 @@ static void cmd_rm(const char *name)
     if(r == -2)      kputs("rm: permission denied\n");
     else if(r < 0)   kputs("rm: failed (is it a directory? use rmdir)\n");
     else             kputs("Deleted.\n");
+}
+
+/* chmod FILE MODE - MODE = two octal digits (owner, others), each 0-7
+ * with bits r=4 w=2 x=1. E.g. "64" = rw-r--, "75" = rwxr-x, "60" = rw---- */
+static void cmd_chmod(const char *args)
+{
+    if(!args || !*args){
+        kputs("usage: chmod FILE MODE   (MODE = two octal digits: owner, others; e.g. 64 = rw-r--)\n");
+        return;
+    }
+    if(!fs_is_ready()){ kputs("NovaFS not formatted.\n"); return; }
+    char name[FS_NAME_LEN];
+    int k = 0;
+    const char *s = args;
+    while(*s == ' ') s++;
+    while(*s && *s != ' ' && k < FS_NAME_LEN - 1) name[k++] = *s++;
+    name[k] = 0;
+    while(*s == ' ') s++;
+    if(!name[0] || !s[0] || !s[1] || s[2] ||
+       s[0] < '0' || s[0] > '7' || s[1] < '0' || s[1] > '7'){
+        kputs("usage: chmod FILE MODE   (MODE = two octal digits, e.g. 64)\n");
+        return;
+    }
+    uint8_t mode = (uint8_t)(((s[0] - '0') << 4) | (s[1] - '0'));
+    int r = fs_chmod(name, mode);
+    if(r == -2)      kputs("chmod: permission denied (not the owner)\n");
+    else if(r < 0)   kputs("chmod: no such file\n");
+    else             kputs("Mode set.\n");
 }
 
 static void process_cmd(void) {
@@ -1592,6 +1651,7 @@ static void process_cmd(void) {
     else if (str_eq(cmd, "cat"))   cmd_cat(args);
     else if (str_eq(cmd, "write")) cmd_write(args);
     else if (str_eq(cmd, "rm"))    cmd_rm(args);
+    else if (str_eq(cmd, "chmod")) cmd_chmod(args);
     else if (str_eq(cmd, "run"))   cmd_run(args);
     else if (str_eq(cmd, "procs")) cmd_procs();
     else if (str_eq(cmd, "fg"))    cmd_fg();

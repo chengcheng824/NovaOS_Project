@@ -63,13 +63,21 @@ int fs_find_in(int dir, const char *name);  /* find in given dir */
 int fs_create(const char *name);
 int fs_write(const char *name, const uint8_t *data, uint32_t len);
 int fs_read(const char *name, uint8_t *buf, uint32_t max);
+                                            /* -2 = read permission denied */
 int fs_size(const char *name);
 int fs_remove(const char *name);
-int fs_list(void (*cb)(const char *name, int type, uint32_t size));
-int fs_list_dir(int dir, void (*cb)(const char*,int,uint32_t));
+int fs_list(void (*cb)(const char *name, int type, uint32_t size, uint8_t mode));
+int fs_list_dir(int dir, void (*cb)(const char*,int,uint32_t,uint8_t));
 int fs_space(uint32_t *used_blocks, uint32_t *used_inodes, uint32_t *used_bytes);
 void fs_setuid(uint8_t uid);   /* owner uid for newly created inodes (0=root) */
+uint8_t fs_getuid(void);       /* current caller uid (0 = root)               */
 void fs_setcwd(int idx);       /* per-process cwd switch (validated)          */
+
+/* permission mode byte (inode pad[4]): high nibble = owner rwx,
+ * low nibble = others rwx; 0 = legacy default rwxr-x. */
+int fs_chmod(const char *name, uint8_t mode);  /* owner/root only, -2 denied  */
+int fs_may_read(const char *name);             /* 1 = allowed                 */
+int fs_may_exec(const char *name);             /* 1 = allowed                 */
 
 /* directory ops */
 int fs_mkdir(const char *name);

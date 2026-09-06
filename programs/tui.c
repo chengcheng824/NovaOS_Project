@@ -257,7 +257,7 @@ static void load_settings(void)
     }
 }
 
-static void save_settings(void)
+static int save_settings(void)
 {
     char buf[192];                              /* stack: syscall buffer */
     char *e = buf;
@@ -268,7 +268,7 @@ static void save_settings(void)
     e = put_str(e, "sizes=");    e = put_str(e, size_names[s_human]);   e = put_str(e, "\n");
     e = put_str(e, "selection=");e = put_str(e, sel_names[s_selbar]);   e = put_str(e, "\n");
     *e = 0;
-    API->writefile("nova.cfg", (unsigned char *)buf, (u32)(e - buf));
+    return API->writefile("nova.cfg", (unsigned char *)buf, (u32)(e - buf));
 }
 
 /* "464 B" / "7.6 K" */
@@ -284,6 +284,8 @@ static void fmt_size(char *out, u32 v)
     *e++ = (char)('0' + (v % 1024) * 10 / 1024);
     e = put_str(e, " K"); *e = 0;
 }
+
+static int s_save_ok;                   /* last settings save succeeded? */
 
 static void settings_apply(int delta)
 {
@@ -308,7 +310,7 @@ static void settings_apply(int delta)
         s_selbar = (s_selbar + 1) % 2;
         break;
     }
-    save_settings();
+    s_save_ok = (save_settings() >= 0);
     API->sysop(18, "");                         /* kernel re-reads nova.cfg */
     draw_screen();
 }
@@ -352,8 +354,12 @@ static void settings_draw(void)
             API->cputs(LX + 23 + str_len(pill), rowy, ">", A_DIM);
         }
     }
-    API->cputs(LX + 3, LY + LH - 2,
-               "accent + quiet are global (kernel reads nova.cfg)", A_DIM);
+    if (s_save_ok)
+        API->cputs(LX + 3, LY + LH - 2,
+                   "accent + quiet are global (kernel reads nova.cfg)", A_DIM);
+    else
+        API->cputs(LX + 3, LY + LH - 2,
+                   "write DENIED - nova.cfg owned by another user", A_ERR);
 }
 
 /* =============================== Files =============================== */
@@ -375,7 +381,8 @@ static void files_load(void)
             continue;
         }
 
-        const char *s = p + 9;                  /* past "  [DIR]  "/"  [FILE] " */
+        /* tag(9) + mode "rwxrwx"(6) + space(1) -> name starts at +16 */
+        const char *s = p + 16;
         const char *q = s;
         while (*q && *q != '\n' && *q != '(') q++;
         while (q > s && q[-1] == ' ') q--;

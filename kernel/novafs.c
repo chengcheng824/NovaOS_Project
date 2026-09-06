@@ -28,10 +28,34 @@ static uint8_t   cur_uid = 0; /* owner uid stamped onto newly created inodes */
 
 /* inode flags byte stores the owner uid (0 = root). Old disks have
  * flags=0, so everything on them is root-owned - exactly right.
- * (pad[0..3] is the indirect block pointer, see below.) root (uid 0)
- * may modify anything. */
+ * (pad[0..3] is the indirect block pointer, see below.)
+ *
+ * Permission mode byte lives in pad[4]: high nibble = owner rwx,
+ * low nibble = others rwx. 0 = legacy default rwxr-x so old disks
+ * behave exactly as before. root (uid 0) bypasses every check. */
+#define FS_MODE_DEFAULT 0x75
+
+static uint8_t effective_mode(int idx){
+    uint8_t m = inode_tab[idx].pad[4];
+    return m ? m : (uint8_t)FS_MODE_DEFAULT;
+}
+
 static int may_modify(int idx){
-    return cur_uid == 0 || inode_tab[idx].flags == cur_uid;
+    if(cur_uid == 0) return 1;
+    if(inode_tab[idx].flags == cur_uid) return 1;
+    return effective_mode(idx) & 0x2;   /* others-w explicitly granted */
+}
+
+static int may_read(int idx){
+    if(cur_uid == 0) return 1;
+    if(inode_tab[idx].flags == cur_uid) return 1;
+    return effective_mode(idx) & 0x4;   /* others-r */
+}
+
+static int may_exec(int idx){
+    if(cur_uid == 0) return 1;
+    if(inode_tab[idx].flags == cur_uid) return 1;
+    return effective_mode(idx) & 0x1;   /* others-x (also gates cd into dirs) */
 }
 
 /* ---------- block bitmap ---------- */
@@ -121,6 +145,30 @@ int fs_init(void){
 int fs_is_ready(void){ return fs_ready; }
 
 void fs_setuid(uint8_t uid){ cur_uid = uid; }
+
+uint8_t fs_getuid(void){ return cur_uid; }
+
+int fs_chmod(const char *name, uint8_t mode){
+    if(!fs_ready) return -1;
+    int idx = fs_find(name);
+    if(idx < 0) return -1;
+    if(cur_uid != 0 && inode_tab[idx].flags != cur_uid) return -2;
+    inode_tab[idx].pad[4] = mode;
+    store_inode_table();
+    return 0;
+}
+
+int fs_may_read(const char *name){
+    if(!fs_ready) return 0;
+    int idx = fs_find(name);
+    return (idx >= 0) ? may_read(idx) : 0;
+}
+
+int fs_may_exec(const char *name){
+    if(!fs_ready) return 0;
+    int idx = fs_find(name);
+    return (idx >= 0) ? may_exec(idx) : 0;
+}
 
 /* switch cwd (per-process support): only live directories accepted,
  * anything else (e.g. a directory another process deleted meanwhile)
@@ -322,6 +370,7 @@ int fs_cd(const char *name){
     int idx = fs_find(name);
     if(idx < 0) return -1;
     if(inode_tab[idx].type != T_DIR) return -1;
+    if(!may_exec(idx)) return -2;   /* cd into a directory needs x */
     cwdir = idx;
     return 0;
 }
@@ -418,6 +467,7 @@ int fs_read(const char *name, uint8_t *buf, uint32_t max){
     if(!fs_ready) return -1;
     int idx = fs_find(name);
     if(idx < 0) return -1;
+    if(!may_read(idx)) return -2;   /* others-r not granted */
     inode_t *in = &inode_tab[idx];
     uint32_t n = in->size;
     if(n > max) n = max;
@@ -472,17 +522,18 @@ int fs_remove(const char *name){
     return 0;
 }
 
-int fs_list(void (*cb)(const char*,int,uint32_t)){
+int fs_list(void (*cb)(const char*,int,uint32_t,uint8_t)){
     return fs_list_dir(cwdir, cb);
 }
 
-int fs_list_dir(int dir, void (*cb)(const char*,int,uint32_t)){
+int fs_list_dir(int dir, void (*cb)(const char*,int,uint32_t,uint8_t)){
     if(!fs_ready) return -1;
     if(dir < 0 || dir >= FS_MAX_INODES) return -1;
     int n = 0;
     for(int i = 1; i < FS_MAX_INODES; i++){
         if(inode_tab[i].type != T_FREE && inode_tab[i].parent == (uint16_t)dir){
-            cb(inode_tab[i].name, (int)inode_tab[i].type, inode_tab[i].size);
+            cb(inode_tab[i].name, (int)inode_tab[i].type, inode_tab[i].size,
+               effective_mode(i));
             n++;
         }
     }

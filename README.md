@@ -121,11 +121,17 @@ Welcome, root. Type 'help' for commands.
 - 改动会立即经 ATA 写回数据盘，重启、重新编译都不丢；`format`（仅 root）会清空账户（root/nova 仍可登录）
 - 用户名上限 23 字符（NovaFS 文件名限制）；密码上限 31 字符、不允许空密码
 - `logout` 回到登录界面可换账户登录
-- **文件属主**：每个文件/目录记录创建者的数字 uid（存于 inode 的 `pad[0]` 字节，root=0；
-  uid 由用户名哈希导出，旧数据盘上的文件 pad[0]=0 天然归 root）。非 root 用户
+- **文件属主**：每个文件/目录记录创建者的数字 uid（存于 inode 的 `flags` 字节，root=0；
+  uid 由用户名哈希导出，旧数据盘上的文件 flags=0 天然归 root）。非 root 用户
   **不能覆盖/删除别人创建**的文件和目录（`rm`/`rmdir`/`rd`/`write` 会得到
   permission denied）；`/passwd` 豁免 —— 改密码走内核的旧密码验证流程
-- 读权限暂不设限（任何用户可读所有文件）；rwx 三位权限组尚未实现
+- **权限位（mode）**：inode 的 `pad[4]` 字节，高 4 位 = 属主 rwx、低 4 位 = 其他人 rwx。
+  `chmod 文件 MODE` 两位八进制修改（仅属主/root），如 `64` = `rw-r--`、`75` = `rwxr-x`、
+  `60` = 仅属主读写。强制点：`cat`/`readfile` 查读位、`run` 查执行位、`cd` 查目录执行位、
+  覆盖/删除查写位；`ls` 显示权限列。**mode=0（旧盘/新文件）按 `rwxr-x` 宽松默认解释**，
+  完全向后兼容 —— 老文件行为不变，要收紧需显式 chmod
+- **进程属主**：进程记录启动者 uid，`kill` 仅 root 或属主可用（TUI Tasks 面板同样生效）；
+  F11/F12 是系统级逃生通道，不受限
 - 登录提示与输入同时回显到串口，方便无显示调试
 
 ## NovaSh 命令
@@ -182,7 +188,7 @@ Welcome, root. Type 'help' for commands.
 
 | 命令        | 说明                                        |
 |-------------|---------------------------------------------|
-| `ls`        | 列当前目录，目录标 `[DIR]`、文件标 `[FILE]` + 大小 |
+| `ls`        | 列当前目录，目录标 `[DIR]`、文件标 `[FILE]` + 权限列（如 `rwxr-x`）+ 大小 |
 | `cd 路径`   | 切目录；支持 `..`（父）、`/`（根）            |
 | `mkdir 名`  | 在 cwd 下建子目录                            |
 | `rmdir 名`  | 删**空**目录                                 |
@@ -197,6 +203,7 @@ Shell prompt 显示 当前用户 和当前工作目录：`root@novaos:/docs/sub#
 | `cat  名`    | 显示文件内容                                             |
 | `write 名`   | 新建/覆盖文件。逐行输入，**单独一行输入 `.` 结束**        |
 | `rm  名`     | 删除文件（目录请用 `rmdir` / `rd`）                      |
+| `chmod F M` | 设权限位，M = 两位八进制（属主/其他人），如 `64` = `rw-r--` |
 | `mkdemo`     | 生成示例程序 demo.nxp（然后 `run demo.nxp`）             |
 
 注：单个文件大小上限 = 6 直接块 + 1 间接块（128 项）= **68608 B**；3072 B 以内只用直接块（旧版完全兼容）。
@@ -444,6 +451,8 @@ typedef struct {
 - inode 的 `pad[0]` 在引入间接块**之前**曾是属主 uid —— 现属主 uid 移到 `flags` 字节
   （0 = root），登录/`su` 时内核调 `fs_setuid()` 切换当前身份，新建的文件/目录打上
   创建者的 uid；非 root 对他人对象的写入/删除操作返回权限错误（`/passwd` 豁免）
+- **权限模式字节**在 `pad[4]`（高 4 位属主 rwx、低 4 位其他人 rwx，0 = 默认 `rwxr-x`），
+  `fs_chmod()` 修改，`may_read/may_exec/may_modify` 在 cat/readfile/run/cd/write/rm 路径强制
 - 每次 inode / bitmap 变动都通过 ATA PIO `ata_write()` 写回磁盘，**持久化**
 - 账户库 `/passwd` 就是根目录下的普通文件（多行 `用户名:哈希`），随 NovaFS 持久化
 

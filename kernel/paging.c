@@ -98,6 +98,7 @@ typedef struct {
     uint32_t fr[NSAVE];                 /* saved iret frame       */
     char     name[13];                  /* program file name      */
     uint32_t cwd;                       /* per-process NovaFS cwd */
+    uint8_t  uid;                       /* owner: spawner's uid   */
 } pcb_t;
 static pcb_t g_pcb[NSLOT];
 static int  g_cur  = -1;                /* pcb interrupted/running */
@@ -121,6 +122,7 @@ int proc_spawn(int slot, const char *name)
     p->fr[11] = slot_stack[slot] - 4;   /* esp: `ret` hits the exit stub */
     p->fr[12] = 0x23;                   /* user ss               */
     p->cwd = (uint32_t)fs_cwd();        /* inherit spawner's directory */
+    p->uid = fs_getuid();               /* inherit spawner's identity  */
     p->state = PST_READY;
     int i = 0;
     while (name && name[i] && i < 12) { p->name[i] = name[i]; i++; }
@@ -198,6 +200,9 @@ void proc_set_current(int slot) { g_cur = slot; g_last = slot; }
 int proc_kill(int pid)
 {
     if (pid < 1 || pid > NSLOT || g_pcb[pid - 1].state == PST_FREE) return -1;
+    /* permission: only root or the process's owner may kill it
+     * (-2 = denied; F11/F12 stay unrestricted as system escape hatches) */
+    if (fs_getuid() != 0 && g_pcb[pid - 1].uid != fs_getuid()) return -2;
     g_pcb[pid - 1].state = PST_FREE;
     return 0;
 }
