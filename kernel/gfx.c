@@ -3,6 +3,7 @@
  * ============================================================ */
 #include "stdint.h"
 #include "gfx.h"
+#include "cnfont.h"
 
 static inline void outb_(uint16_t p, uint8_t v)
 {
@@ -224,6 +225,52 @@ void gfx_cell(int cx, int cy, char ch, uint8_t fg_idx, uint8_t bg_idx)
         for (int b = 0; b < GLYPH_W; b++)
             px(x0 + b, y0 + r, (bits & (0x80 >> b)) ? fg : bg);
     }
+}
+
+extern const uint8_t *cn_glyph(unsigned short code);   /* cnfont.c */
+
+/* ---- CJK 16x16 rendering (cn_lang_support phase 1, see cnfont.h) ----
+ * ASCII advances 8px using the captured VGA font; a UTF-8 codepoint with
+ * a bank glyph advances 16px as a full-width block. Caller owes one
+ * cn_can_render() check. */
+int cn_text16(int x, int y, const char *s, uint32_t rgb)
+{
+    if (!gfx_on || !s) return -1;
+    int adv = 0;
+    while (*s) {
+        unsigned char c = (unsigned char)*s;
+        if (c < 0x80) {
+            const uint8_t *g = font[c];
+            for (int r = 0; r < GLYPH_H; r++) {
+                uint8_t bits = g[r];
+                for (int b = 0; b < GLYPH_W; b++)
+                    px(x + adv + b, y + r, (bits & (0x80 >> b)) ? rgb : bg_col);
+            }
+            adv += GLYPH_W;
+            s++;
+            continue;
+        }
+        unsigned short cp; int len;
+        if ((c & 0xE0) == 0xC0 && (s[1] & 0xC0) == 0x80) {
+            cp = ((unsigned short)(c & 0x1F) << 6) | (unsigned short)(s[1] & 0x3F);
+            len = 2;
+        } else if ((c & 0xF0) == 0xE0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80) {
+            cp = ((unsigned short)(c & 0x0F) << 12)
+               | ((unsigned short)(s[1] & 0x3F) << 6)
+               | (unsigned short)(s[2] & 0x3F);
+            len = 3;
+        } else return adv > 0 ? adv : -1;
+        const uint8_t *g = cn_glyph(cp);
+        if (!g) return adv > 0 ? adv : -1;
+        for (int r = 0; r < 16; r++) {
+            uint16_t bits = (uint16_t)((g[r * 2] << 8) | g[r * 2 + 1]);
+            for (int b = 0; b < 16; b++)
+                px(x + adv + b, y + r, (bits & (0x8000 >> b)) ? rgb : bg_col);
+        }
+        adv += 16;
+        s += len;
+    }
+    return adv;
 }
 
 static void draw_cell(int cx, int cy)

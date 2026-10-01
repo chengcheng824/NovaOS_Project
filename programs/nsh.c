@@ -344,6 +344,37 @@ static int exec_line(char *l, int silent)
     if (str_eq(cmd, "wget"))     { if (!*args) { ps("wget HOST[:PORT] [/PATH]\n"); return 0; }
                                    API->sysop(17, args); return 0; }
     if (str_eq(cmd, "udpecho"))  { API->sysop(16, ""); return 0; }
+    /* feature / feture (alias): module switches via sysop 19/20 */
+    if (str_eq(cmd, "feature") || str_eq(cmd, "feture")) {
+        if (!*args) {
+            char lb[512];
+            API->sysop(19, lb);
+            ps(lb);
+            return 0;
+        }
+        char sub[12], name[24];
+        int k = 0;
+        char *s2 = args;
+        while (*s2 == ' ') s2++;
+        while (*s2 && *s2 != ' ' && k < 11) sub[k++] = *s2++;
+        sub[k] = 0;
+        while (*s2 == ' ') s2++;
+        k = 0;
+        while (*s2 && *s2 != ' ' && k < 23) name[k++] = *s2++;
+        name[k] = 0;
+        if (!name[0] || (str_eq(sub, "enable") == 0 && str_eq(sub, "disable") == 0)) {
+            ps("usage: feature [enable NAME | disable NAME]\n");
+            return 0;
+        }
+        char arg[40];
+        k = 0;
+        for (int j = 0; name[j]; j++) arg[k++] = name[j];
+        arg[k++] = '=';
+        for (int j = 0; sub[j]; j++) arg[k++] = sub[j];
+        arg[k] = 0;
+        if (API->sysop(20, arg) < 0) ps("feature: no such module\n");
+        return 0;
+    }
     if (str_eq(cmd, "logout"))   { API->exit(); return 0; }
 
     /* ---- local info commands ---- */

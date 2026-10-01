@@ -15,6 +15,9 @@ static void nx_str_cpy(char *d,const char *s){ while((*d++=*s++)); }
 static void nx_memset(void *d,int v,int n){ unsigned char *p=d; while(n--) *p++=(unsigned char)v; }
 static void nx_memcpy(void *d,const void *s,int n){ unsigned char *dd=d; const unsigned char *ss=s; while(n--) *dd++=*ss++; }
 
+/* persistence (defined below, needed by fs_chmod early) */
+static int store_inode_table(void);
+
 /* The superblock lives in a full 512-byte sector buffer: ATA PIO always
  * transfers whole sectors, so reading into a bare 20-byte struct would
  * splash 492 bytes of sector data over neighbouring .bss variables. */
@@ -38,6 +41,21 @@ static uint8_t   cur_uid = 0; /* owner uid stamped onto newly created inodes */
 static uint8_t effective_mode(int idx){
     uint8_t m = inode_tab[idx].pad[4];
     return m ? m : (uint8_t)FS_MODE_DEFAULT;
+}
+
+/* chmod may not store 0: pad[4]==0 is the legacy-default sentinel
+ * (rwxr-x), so "chmod 00" would silently re-open the file. Refuse it -
+ * the tightest representable mode is 0x10 (owner r--... actually any
+ * nonzero nibble pair, e.g. 0x10 = owner r, others none). */
+int fs_chmod(const char *name, uint8_t mode){
+    if(!fs_ready) return -1;
+    if(!mode) return -3;               /* 0 = sentinel, not a real mode */
+    int idx = fs_find(name);
+    if(idx < 0) return -1;
+    if(cur_uid != 0 && inode_tab[idx].flags != cur_uid) return -2;
+    inode_tab[idx].pad[4] = mode;
+    store_inode_table();
+    return 0;
 }
 
 static int may_modify(int idx){
@@ -111,6 +129,11 @@ static void free_blocks(inode_t *in){
 }
 
 /* ---------- persistence ---------- */
+static int load_inode_table(void);
+static int store_inode_table(void);
+static int load_bmap(void);
+static int store_bmap(void);
+
 static int load_inode_table(void){ return ata_read(FS_INODE_LBA, (uint8_t*)inode_tab, FS_INODE_SECS); }
 static int store_inode_table(void){ return ata_write(FS_INODE_LBA, (uint8_t*)inode_tab, FS_INODE_SECS); }
 static int load_bmap(void){ return ata_read(FS_BMAP_LBA, bmap, FS_BMAP_SECS); }
@@ -147,16 +170,6 @@ int fs_is_ready(void){ return fs_ready; }
 void fs_setuid(uint8_t uid){ cur_uid = uid; }
 
 uint8_t fs_getuid(void){ return cur_uid; }
-
-int fs_chmod(const char *name, uint8_t mode){
-    if(!fs_ready) return -1;
-    int idx = fs_find(name);
-    if(idx < 0) return -1;
-    if(cur_uid != 0 && inode_tab[idx].flags != cur_uid) return -2;
-    inode_tab[idx].pad[4] = mode;
-    store_inode_table();
-    return 0;
-}
 
 int fs_may_read(const char *name){
     if(!fs_ready) return 0;
@@ -218,6 +231,11 @@ int fs_find_in(int dir, const char *name){
 }
 
 int fs_find(const char *name){ return fs_find_in(cwdir, name); }
+
+int fs_type_of(int idx){
+    if(!fs_ready || idx < 0 || idx >= FS_MAX_INODES) return -1;
+    return (int)inode_tab[idx].type;
+}
 
 /* allocate a free inode, clear it, return index or -1 */
 static int alloc_inode(void){

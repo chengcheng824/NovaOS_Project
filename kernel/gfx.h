@@ -46,4 +46,8 @@ void gfx_text(int x, int y, const char *s, uint32_t rgb);
  * effects. VGA attr convention: fg = attr & 0xF, bg = (attr >> 4) & 0xF */
 void gfx_cell(int cx, int cy, char ch, uint8_t fg_idx, uint8_t bg_idx);
 
+/* CJK 16x16 text (cn_lang_support): UTF-8 in, mixed 8/16px advance out;
+ * -1 = a char is outside the glyph bank */
+int cn_text16(int x, int y, const char *s, uint32_t rgb);
+
 #endif

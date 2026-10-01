@@ -60,6 +60,7 @@ int fs_is_ready(void);
 int fs_format(void);
 int fs_find(const char *name);              /* find in current dir */
 int fs_find_in(int dir, const char *name);  /* find in given dir */
+int fs_type_of(int idx);                    /* T_FREE/T_FILE/T_DIR, -1 = bad idx */
 int fs_create(const char *name);
 int fs_write(const char *name, const uint8_t *data, uint32_t len);
 int fs_read(const char *name, uint8_t *buf, uint32_t max);

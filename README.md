@@ -19,7 +19,9 @@ NovaOS/
 │   ├── acpi.c / acpi.h     # 最小 ACPI/AML 解析器 (RSDP→FADT→DSDT, 解析 \_S5 关机)
 │   ├── gfx.c / gfx.h       # Bochs VBE 图形驱动: 1024x768x32 真彩控制台 (128x48)
 │   ├── e1000.c / e1000.h   # Intel 82540EM (QEMU e1000) 网卡驱动: PCI 扫描 + 轮询收发环
-│   ├── net.c / net.h       # 精简 TCP/IP 栈: ARP/IPv4/ICMP/UDP + DHCP/DNS/echo 命令
+│   ├── net.c / net.h       # 精简 TCP/IP 栈: ARP/IPv4/ICMP/UDP/TCP + DHCP/DNS + wget
+│   ├── feature.c / feature.h # feature 子系统: /etc/features.conf 模块开关 + 安全 gate
+│   ├── cnfont.c / cnfont.h   # 限量简体字形 bank + cn_text16 中文渲染 (cnfont_glyphs.h 自动生成)
 │   ├── stdint.h            # 最小 stdint
 │   └── link.ld             # 链接脚本 (段紧凑于 0x100000)
 ├── programs/               # Ring3 用户程序源码 (build 自动编译注入)
@@ -28,11 +30,14 @@ NovaOS/
 │   ├── ringok.c / ringbad.c  # Ring3 健全性 / 用户态故障测试
 │   ├── paint.c             # 鼠标画板
 │   ├── snake.c             # 贪吃蛇 (第一个原生游戏)
-│   ├── tui.c               # tui.nxp: 全屏 TUI (文件浏览 / 任务 / 系统三面板)
+│   ├── tui.c               # tui.nxp: 全屏 TUI (文件/任务/系统/设置 四面板, 暗色主题)
+│   ├── featureui.c         # featureui.nxp: feature 开关管理 TUI
 │   └── nsh.c               # nsh.nxp: 完整 NovaSh + .nsh 脚本引擎
 ├── scripts/                # .nsh 示例脚本 (build 注入 data-seed.img)
 │   ├── hello.nsh           # 第一个脚本：变量 / 回显 / pause
 │   └── count.nsh           # if/goto 循环倒数 3-2-1
+├── tools/                  # 实用工具 (genfont.ps1 字形生成器, inject.ps1 注入器)
+├── tests/                  # 自动化回归 (nettest/permtest/feattest/eggtest/logintest/...)
 ├── build.ps1  build.bat    # 构建脚本 (NASM + gcc + ld + objcopy -> disk.img + data-seed.img)
 ├── run.ps1    run.bat      # QEMU 启动脚本 (双盘 + e1000 user 网络 + 7777 hostfwd + 监视器 4444 + 串口日志)
 └── README.md
@@ -114,7 +119,8 @@ Password: ****          ← 输入回显为 *，支持退格
 Welcome, root. Type 'help' for commands.
 ```
 
-- **默认账户**：`root` / 密码 `nova`（root 隐含存在；`/passwd` 里没有 root 行时用默认密码）
+- **默认账户**：`root` **免密登录**——root 隐含存在，`/passwd` 里没有 root 行时登录**不提示密码**，输入 root 直接回车进系统（普通用户仍必须设密码）
+- **root 设/清密码**：`passwd`（root 身份）设密码，设了之后登录就要输；新密码留空 = 移除 root 密码回到免密。**防后门**：root 无密码时普通用户 `su root` 会被拒绝（必须先由 root 设一个密码），免密只信任登录界面
 - **账户库**：NovaFS 根目录的 `/passwd`，每行 `用户名:FFFFFFFF`（8 位十六进制 FNV-1a 哈希，**不存明文**）
 - **家目录**：`useradd` 自动建 `/home/<名字>`；非 root 用户登录（或 `su` 过去）后直接落在自己家里，root 落在 `/`
 - **特权分离**：仅 root 可 `useradd` / `userdel` / `format`；`su` 时 root 切换免密、普通用户要输目标密码
@@ -126,10 +132,15 @@ Welcome, root. Type 'help' for commands.
   **不能覆盖/删除别人创建**的文件和目录（`rm`/`rmdir`/`rd`/`write` 会得到
   permission denied）；`/passwd` 豁免 —— 改密码走内核的旧密码验证流程
 - **权限位（mode）**：inode 的 `pad[4]` 字节，高 4 位 = 属主 rwx、低 4 位 = 其他人 rwx。
-  `chmod 文件 MODE` 两位八进制修改（仅属主/root），如 `64` = `rw-r--`、`75` = `rwxr-x`、
-  `60` = 仅属主读写。强制点：`cat`/`readfile` 查读位、`run` 查执行位、`cd` 查目录执行位、
-  覆盖/删除查写位；`ls` 显示权限列。**mode=0（旧盘/新文件）按 `rwxr-x` 宽松默认解释**，
-  完全向后兼容 —— 老文件行为不变，要收紧需显式 chmod
+  `chmod 文件 MODE` 两位八进制修改（仅属主/root）。**每个数字是三个开关的和：
+  4=读 r、2=写 w、1=执行 x**——`6` = 4+2 = 读写、`5` = 4+1 = 读+执行、`7` = 全开、
+  `0` = 无。常用值：`60` = 仅属主读写（私人文件）、`75` = `rwxr-x`（程序照常能跑）、
+  `66` = 大家都可读写（共享文件）、`64` = `rw-r--`。
+  强制点：`cat`/`readfile` 查读位、`run` 查执行位、`cd` 查目录执行位、
+  覆盖/删除查写位；`ls` 显示权限列（`rwxr-x` = 属主3位+其他人3位）。
+  **mode=0（旧盘/新文件）按 `rwxr-x` 宽松默认解释**，完全向后兼容 —— 老文件
+  行为不变，要收紧需显式 chmod；也因此 `chmod 00` 被**禁止**（0 是"默认全开"
+  的哨兵值，设 00 会悄悄把文件变全开），最紧用 `10`（属主仅写）或 `40`（其他人只读）
 - **进程属主**：进程记录启动者 uid，`kill` 仅 root 或属主可用（TUI Tasks 面板同样生效）；
   F11/F12 是系统级逃生通道，不受限
 - 登录提示与输入同时回显到串口，方便无显示调试
@@ -144,7 +155,7 @@ Welcome, root. Type 'help' for commands.
 | `passwd`      | 改当前用户密码（验旧密码 → 新密码输两遍）   |
 | `useradd 名`  | 创建用户并建家目录 `/home/名`（**仅 root**）|
 | `userdel 名`  | 删除用户及家目录（**仅 root**，root 不可删）|
-| `su 名`       | 切换用户：root 免密，其他用户需输目标密码；切换后落到对方家目录 |
+| `su 名`       | 切换用户：root 切换免密，其他用户需输目标密码；切换后落到对方家目录。<br>**root 免密时 `su root` 被拒绝**（防提权后门），须先由 root 设密码 |
 | `logout`      | 注销，返回登录界面                          |
 
 特权模型：只有 **root** 能执行 `useradd` / `userdel` / `format`，
@@ -203,7 +214,7 @@ Shell prompt 显示 当前用户 和当前工作目录：`root@novaos:/docs/sub#
 | `cat  名`    | 显示文件内容                                             |
 | `write 名`   | 新建/覆盖文件。逐行输入，**单独一行输入 `.` 结束**        |
 | `rm  名`     | 删除文件（目录请用 `rmdir` / `rd`）                      |
-| `chmod F M` | 设权限位，M = 两位八进制（属主/其他人），如 `64` = `rw-r--` |
+| `chmod F M`  | 改权限位（change mode）。M 两位八进制 = 属主、其他人，每位 4=读 2=写 1=执行：<br>`60` 私人文件 · `75` 程序（rwxr-x）· `66` 共享可写 · `64` = `rw-r--`；仅属主/root 可改，`00` 禁止 |
 | `mkdemo`     | 生成示例程序 demo.nxp（然后 `run demo.nxp`）             |
 
 注：单个文件大小上限 = 6 直接块 + 1 间接块（128 项）= **68608 B**；3072 B 以内只用直接块（旧版完全兼容）。
@@ -566,6 +577,47 @@ NovaFS 根目录的 `nova.cfg` 是系统级配置（键值对文本），内核�
 
 TUI 启动时会 `cd /` 保证 nova.cfg 落在内核读取的位置；文件不存在时全部用默认值。
 
+## Feature 子系统（模块开关）
+
+`kernel/feature.c` + `/etc/features.conf` 提供模块级 kill switch：
+
+```ini
+holiday_module=enable
+cn_lang_support=disable
+```
+
+- **`feature_is_enabled(name)`**（需求 1）：内核任何代码在调模块入口前查它；
+  未注册/文件缺失一律按 disabled 处理（fail-closed）
+- **shell `feature` 命令**（需求 2）：`feature` 列出全部模块与状态（每行一个，
+  名字带强调色）；`feature enable|disable 名` 即时切换并写回 `/etc/features.conf`
+  （持久）；`feature check 名` 单查；`feature demo` 实际调用两个内置模块的入口
+  做演示。**拼写别名**：键盘打不顺的话 `feture` 完全等价（内核 shell 和 nsh 均可）
+- **`featureui.nxp`**（需求 3）：`run featureui.nxp` 进入开关管理 TUI，
+  `↑/↓` 选择、空格/`←/→` 切换、`r` 重载、`q` 退出；经 sysop 19/20 走内核实现
+- **安全规则**（需求 5/8）：模块对外入口的**第一行**必须调
+  `feature_is_enabled()`，关闭时返回"BLOCKED"——见 `feat_holiday_days_left()`
+  / `feat_cn_toggle()` / `feat_cn_greeting()` 的写法（需求 6：外壳框架，
+  内部逻辑 TODO 预留）
+- 配置在 `/etc` 目录（首次启动自动创建），`/etc/features.conf` 不存在时自动
+  生成默认文件；NovaFS 无路径语法，feature.c 内部通过临时切换 cwd 实现 /etc 访问
+- **max 16 模块**（`FEAT_MAX`），名字 ≤23 字符；新模块在表尾追加即可
+
+### holiday_module 国庆彩蛋（中文显示，cn_lang_support phase 1）
+
+第一个走通"feature gate → 中文渲染"全链路的功能：
+
+- **字库**：`kernel/cnfont.c` 内置限量 16×16 简体字形 bank（国庆节快乐祖国
+  生日 8 字），由 `tools\genfont.ps1` 用宿主机**微软雅黑**程序化渲染生成
+  （`kernel/cnfont_glyphs.h`，勿手改；换字重跑生成器即可）。全字库数百 KB
+  不可行，限量 bank 是当前内核预算下唯一现实方案；`cn_can_render()` 保证
+  字库外的字符串不会被错误渲染
+- **渲染**：`gfx.c` 的 `cn_text16(x,y,s,rgb)` —— UTF-8 输入，ASCII 8px +
+  汉字 16px 全角混排，直接画进 VBE LFB（VGA 文本后备无点阵能力，自动跳过）
+- **彩蛋**：RTC 日期 = 10/1–10/7 时 `feature demo` 在屏幕顶部画出红色
+  「国庆节快乐」；其余日期显示距 10/1 的倒计时天数。**双开关**：关闭
+  `holiday_module` 彩蛋逻辑停，关闭 `cn_lang_support` 中文渲染停，
+  任一关闭横幅都不出现（feature gate 的真实用例）
+
 实现要点（想写自己的 TUI 程序照抄即可）：
 - 内核只提供 4 个编元寻址 syscall（putcell / cellfill / cputs / cursor，见
   「.nxp 程序格式」），控制台路由在 `kernel.c` 的 `con_put/con_fill/con_cursor`，
@@ -609,17 +661,20 @@ tools\inject.ps1 -Image data.img -Programs tui,nsh    # 自动备份 -> data.img
 | `nettest.ps1`     | 登录 → netinfo(DHCP) → ping → dns → udpecho + 宿主机 UDP 回环 |
 | `nshtest.ps1`     | nsh.nxp 里走 sysop 的同名网络命令                          |
 | `wgettext.ps1`    | 配 `httphost.ps1`（宿主机 8080 HTTP 服务器），端到端验证 TCP/wget 并 `cat` 回读 |
-| `tuitest.ps1`     | 驱动 TUI 三个面板 + 文件查看器，`screendump` 截屏逐屏检查   |
+| `tuitest.ps1`     | 驱动 TUI 四个面板 + 文件查看器 + 全局变色/静默启动，`screendump` 截屏逐屏检查 |
+| `permtest.ps1`    | 多用户权限全场景：u1 的 cat/chmod/write/rm 全拒、run 放行、root 正常 |
+| `feattest.ps1`    | feature 子系统：列表/开关/hook 拦截/重启持久化（9 项断言）  |
+| `eggtest.ps1`     | 国庆彩蛋：`-rtc base=2026-10-01` 验证中文横幅 + 双 gate（参数 `-Date` 换日期） |
+| `logintest.ps1`   | root 免密登录/设密/清密/su 防后门全链路（7 项断言）         |
 | `ppm2png.ps1`     | QEMU 截屏 (PPM) 转 PNG 的小工具                            |
 
 测试用临时数据盘 `data-nettest.img`（由 `data-seed.img` 复制），产物
-`serial-nettest.log` / `build\shot*.ppm` 均为临时文件。
+`serial-*.log` / `build\shot*.ppm` 均为临时文件。
 
 ## 常见流程示例
 
 ```
-NovaOS login: root
-Password: ****
+NovaOS login: root                    ← root 免密：无需密码，回车即进
 Welcome, root. Type 'help' for commands.
 
 root@novaos:/# useradd alice

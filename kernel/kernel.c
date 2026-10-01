@@ -10,6 +10,8 @@
 #include "gfx.h"
 #include "paging.h"
 #include "net.h"
+#include "feature.h"
+#include "cnfont.h"
 
 /* ---- Port I/O ---- */
 static inline void outb(uint16_t port, uint8_t v)
@@ -458,6 +460,18 @@ static uint8_t cmos_read(uint8_t reg)
     return inb(CMOS_DATA);
 }
 
+/* binary month/day for the feature subsystem (holiday countdown);
+ * consolidates the BCD conversion the date path does */
+void rtc_get_md(int *mon, int *day)
+{
+    uint8_t m = cmos_read(0x08);
+    uint8_t d = cmos_read(0x07);
+    uint8_t regb = cmos_read(0x0B);
+    if (!(regb & 0x04)) { m = bcd_to_bin(m); d = bcd_to_bin(d); }
+    if (mon) *mon = m;
+    if (day) *day = d;
+}
+
 /* append helpers for building a date string into a buffer (shared by the
  * kernel 'date' command and the SYS_GETDATE syscall) */
 static int buf_ch(char *buf, int n, int max, char c)
@@ -638,6 +652,76 @@ static void cfg_load(void)
     cfg_apply_text(cfg_buf);
 }
 
+/* ---- feature command (list / enable / disable / demo hooks) ---- */
+static void cmd_feature(const char *args)
+{
+    char name[FEAT_NAME_MAX];
+    name[0] = 0;
+    const char *s = args ? args : "";
+    while (*s == ' ') s++;
+    int k = 0;
+    const char *w1 = s;
+    while (*s && *s != ' ' && k < FEAT_NAME_MAX - 1) name[k++] = *s++;
+    name[k] = 0;
+    while (*s == ' ') s++;
+    const char *w2 = s;                     /* feature name for enable/disable */
+
+    if (!name[0]) {                         /* list all */
+        char lb[512];
+        int n = feature_list(lb, (uint32_t)sizeof lb);
+        if (!n) { kputs("no features registered\n"); return; }
+        kputs("feature              state\n");
+        const char *p = lb;
+        while (*p) {
+            set_color(g_accent);
+            while (*p && *p != ' ') kput(*p++);     /* name (padded to 21) */
+            reset_color();
+            while (*p && *p != '\n') kput(*p++);    /* pad + state */
+            kput('\n');                             /* the buffer's newline is
+                                                       consumed, not printed */
+            if (*p) p++;
+        }
+        return;
+    }
+    if (str_eq(name, "enable") || str_eq(name, "disable")) {
+        if (!w2 || !*w2) {
+            kputs("usage: feature enable NAME | feature disable NAME\n");
+            return;
+        }
+        int on = str_eq(name, "enable");
+        int r = feature_set(w2, on);
+        if (r < 0) { kputs("feature: no such module\n"); return; }
+        kputs(w2); kputs(on ? " enabled (saved to /etc/features.conf)\n"
+                            : " disabled (saved to /etc/features.conf)\n");
+        return;
+    }
+    if (str_eq(name, "check")) {            /* demo of the mandatory gate */
+        if (!w2 || !*w2) { kputs("usage: feature check NAME\n"); return; }
+        kputs(feature_is_enabled(w2) ? "enabled\n" : "disabled\n");
+        return;
+    }
+    if (str_eq(name, "demo")) {             /* call the gated module hooks */
+        int h = feat_holiday_days_left();
+        kputs("holiday_module.days_left() -> ");
+        if (h == -1) kputs("BLOCKED (module disabled)\n");
+        else if (h == 0) {
+            kputs("TODAY! (national day holiday)\n");
+            feat_holiday_banner();
+            kputs("  banner drawn on screen\n");
+        }
+        else {
+            kput_dec((unsigned)h); kputs(" day(s) to Oct 1\n");
+            feat_holiday_banner();          /* no-op unless it IS the holiday */
+        }
+        const char *g = feat_cn_greeting();
+        kputs("cn_lang_support.greeting() -> ");
+        if (!g) kputs("BLOCKED (module disabled)\n");
+        else { kputs(g); kput('\n'); }
+        return;
+    }
+    kputs("usage: feature [enable NAME | disable NAME | check NAME | demo]\n");
+}
+
 static void shell_prompt(void)
 {
     con_cursor(1);      /* a killed TUI may have hidden the hw cursor */
@@ -678,6 +762,7 @@ static void cmd_help(void)
     set_color(g_accent); vga_puts("  write F "); reset_color(); kputs("create file (end with .)\n");
     set_color(g_accent); vga_puts("  rm F    "); reset_color(); kputs("delete file\n");
     set_color(g_accent); vga_puts("  chmod F "); reset_color(); kputs("set permissions (e.g. 64 = rw-r--)\n");
+    set_color(g_accent); vga_puts("  feature "); reset_color(); kputs("module switches (enable/disable, /etc/features.conf)\n");
     set_color(g_accent); vga_puts("  run F   "); reset_color(); kputs("run .nsh script / start .nxp process\n");
     set_color(g_accent); vga_puts("  procs   "); reset_color(); kputs("list running processes\n");
     set_color(g_accent); vga_puts("  fg      "); reset_color(); kputs("resume suspended processes\n");
@@ -1030,7 +1115,7 @@ static int nxp_api_fsop(uint32_t op, const char *name)
 /* system ops by opcode: 1=useradd 2=userdel 3=passwd 4=su 5=mkdemo
  * 6=acpi 7=reboot 8=shutdown 9=halt 10=fg(resume all) 11=kill pid
  * 12=netinfo 13=ping 14=dhcp 15=dns 16=udpecho 17=wget
- * 18=cfg reload (tui settings panel re-reads nova.cfg) */
+ * 18=cfg reload 19=feature list 20=feature set (name "N=enable|disable") */
 static int nxp_api_sysop(uint32_t op, const char *name)
 {
     switch (op) {
@@ -1058,6 +1143,18 @@ static int nxp_api_sysop(uint32_t op, const char *name)
     case 16: cmd_net_udpecho(); return 0;
     case 17: cmd_wget(name);    return 0;
     case 18: cfg_load();        return 0;
+    case 19: return feature_list((char *)name, 512);
+    case 20: {
+        /* name = "module=enable" or "module=disable" */
+        if (!name) return -1;
+        char mod[FEAT_NAME_MAX];
+        int k = 0;
+        const char *eq = name;
+        while (*eq && *eq != '=' && k < FEAT_NAME_MAX - 1) mod[k++] = *eq++;
+        mod[k] = 0;
+        if (*eq != '=') return -1;
+        return feature_set(mod, str_eq(eq + 1, "enable"));
+    }
     default: return -1;
     }
 }
@@ -1604,6 +1701,10 @@ static void cmd_chmod(const char *args)
         return;
     }
     uint8_t mode = (uint8_t)(((s[0] - '0') << 4) | (s[1] - '0'));
+    if(!mode){
+        kputs("chmod: mode 00 not allowed (00 means \"legacy default\" on disk)\n");
+        return;
+    }
     int r = fs_chmod(name, mode);
     if(r == -2)      kputs("chmod: permission denied (not the owner)\n");
     else if(r < 0)   kputs("chmod: no such file\n");
@@ -1652,6 +1753,7 @@ static void process_cmd(void) {
     else if (str_eq(cmd, "write")) cmd_write(args);
     else if (str_eq(cmd, "rm"))    cmd_rm(args);
     else if (str_eq(cmd, "chmod")) cmd_chmod(args);
+    else if (str_eq(cmd, "feature") || str_eq(cmd, "feture")) cmd_feature(args);
     else if (str_eq(cmd, "run"))   cmd_run(args);
     else if (str_eq(cmd, "procs")) cmd_procs();
     else if (str_eq(cmd, "fg"))    cmd_fg();
@@ -1700,11 +1802,10 @@ static void shell_run(void) {
 }
 
 /* ============================================================
- * Login: single user "root", password hash stored in /passwd
- * default password: "nova"
+ * Login: root is implicit and PASSWORDLESS (no /passwd line = no prompt).
+ * 'passwd' as root sets one; an empty new password removes it again.
  * ============================================================ */
 #define LOGIN_USER     "root"
-#define LOGIN_DEF_PASS "nova"
 #define PASS_MAX       32
 
 /* privilege model: root manages accounts + formats; everyone else may not.
@@ -1783,11 +1884,13 @@ static int passwd_load(void)
     return sz;
 }
 
-/* look up a user; returns 1 and stores hash when found */
+/* look up a user; returns 1 and stores hash when found.
+ * Passwordless root: root is implicit and normally has NO line in
+ * /passwd - that state means "no password" (login skips the prompt).
+ * If a root line exists it must match exactly. */
 static int login_find_hash(const char *user, uint32_t *out)
 {
     int len = str_len(user);
-    uint32_t def = pass_hash(LOGIN_DEF_PASS);
     if (fs_is_ready()) {
         fs_getcwd(cwdbuf, sizeof(cwdbuf));
         fs_cd("/");
@@ -1808,7 +1911,7 @@ static int login_find_hash(const char *user, uint32_t *out)
                         if (d < 0) { bad = 1; break; }
                         v = (v << 4) | (uint32_t)d;
                     }
-                    if (bad) return 0;   /* corrupted line: never grant the default password */
+                    if (bad) return 0;   /* corrupted line: never grant access */
                     *out = v;
                     return 1;
                 }
@@ -1816,9 +1919,15 @@ static int login_find_hash(const char *user, uint32_t *out)
             i = j + 1;
         }
     }
-    /* root exists implicitly with the default password */
-    if (str_eq(user, LOGIN_USER)) { *out = def; return 1; }
-    return 0;
+    return 0;    /* root with no line = passwordless (handled by callers) */
+}
+
+/* 1 = this account logs in WITHOUT a password (root with no /passwd line) */
+static int login_is_passwordless(const char *user)
+{
+    uint32_t h;
+    if (!str_eq(user, LOGIN_USER)) return 0;   /* only root may be passwordless */
+    return !login_find_hash(user, &h);         /* no line = no password */
 }
 
 /* add or update one user line, drop every other line for that name */
@@ -1902,6 +2011,17 @@ static void login_run(void)
         serial_puts("\nNovaOS login: ");
         read_line(user, sizeof(user), 0);
         serial_puts(user); serial_putc('\n');
+        if (login_is_passwordless(user)) {
+            /* root without a /passwd line: no password prompt at all */
+            for (int i = 0; i < (int)sizeof(g_cur_user); i++)
+                g_cur_user[i] = user[i];
+            fs_setuid(user_uid(user));
+            fs_cd("/");
+            kputs("\nWelcome, ");
+            set_color(C_LGREEN); kputs(g_cur_user); reset_color();
+            kputs(". Type 'help' for commands.\n");
+            return;
+        }
         set_color(g_accent); vga_puts("Password: "); reset_color();
         serial_puts("Password: ");
         read_line(pass, sizeof(pass), 1);
@@ -1934,17 +2054,31 @@ static void cmd_passwd(void)
 {
     if (!fs_is_ready()) { kputs("passwd: NovaFS not formatted, cannot save\n"); return; }
     char oldp[PASS_MAX], p1[PASS_MAX], p2[PASS_MAX];
-    set_color(C_LCYAN); vga_puts("Old password: "); reset_color();
-    read_line(oldp, sizeof(oldp), 1);
-    uint32_t h;
-    if (!login_find_hash(g_cur_user, &h) || pass_hash(oldp) != h) {
-        set_color(C_LRED); kputs("passwd: wrong password\n"); reset_color();
+    if (login_is_passwordless(g_cur_user)) {
+        kputs("passwd: root has no password - leave the new one empty to keep it that way\n");
+    } else {
+        set_color(g_accent); vga_puts("Old password: "); reset_color();
+        read_line(oldp, sizeof(oldp), 1);
+        uint32_t h;
+        if (!login_find_hash(g_cur_user, &h) || pass_hash(oldp) != h) {
+            set_color(C_LRED); kputs("passwd: wrong password\n"); reset_color();
+            return;
+        }
+    }
+    set_color(g_accent); vga_puts("New password: "); reset_color();
+    read_line(p1, sizeof(p1), 1);
+    if (!p1[0]) {
+        /* empty new password: root -> drop the line (passwordless again);
+         * normal users keep their mandatory password */
+        if (str_eq(g_cur_user, LOGIN_USER)) {
+            if (login_del_user(LOGIN_USER) < 0) { kputs("passwd: already passwordless\n"); return; }
+            kputs("passwd: root password removed (passwordless login on)\n");
+            return;
+        }
+        kputs("passwd: empty password not allowed\n");
         return;
     }
-    set_color(C_LCYAN); vga_puts("New password: "); reset_color();
-    read_line(p1, sizeof(p1), 1);
-    if (!p1[0]) { kputs("passwd: empty password not allowed\n"); return; }
-    set_color(C_LCYAN); vga_puts("Retype new password: "); reset_color();
+    set_color(g_accent); vga_puts("Retype new password: "); reset_color();
     read_line(p2, sizeof(p2), 1);
     if (!str_eq(p1, p2)) { kputs("passwd: passwords do not match\n"); return; }
     if (login_set_user(g_cur_user, pass_hash(p1)) < 0) {
@@ -2011,6 +2145,13 @@ static void cmd_su(const char *name)
     if (!name || !*name) { kputs("usage: su <user>\n"); return; }
     if (str_len(name) >= FS_NAME_LEN) { kputs("su: no such user\n"); return; }
     if (str_eq(name, g_cur_user)) { kputs("su: already this user\n"); return; }
+    if (login_is_passwordless(name)) {
+        /* su into root: passwordless root only trusts the login screen,
+         * otherwise passwordless login would be a privilege-escalation
+         * backdoor for every account */
+        kputs("su: root has no password - set one first ('passwd' as root)\n");
+        return;
+    }
     if (!login_find_hash(name, &h)) { kputs("su: no such user\n"); return; }
     if (!is_root()) {
         set_color(g_accent); vga_puts("Password: "); reset_color();
@@ -2133,6 +2274,7 @@ void kmain(void) {
     int fr = fs_init();        /* mount BEFORE the banner: nova.cfg drives
                                 * accent + quiet, and quiet hides the rest */
     cfg_load();
+    feature_init();            /* /etc/features.conf - module kill switches */
     if (!g_quiet) {
         banner();
         gfx_probe("after-banner");
@@ -2154,6 +2296,7 @@ void kmain(void) {
         if (fr == 0)      boot_tag(1, "novafs", "mounted");
         else if (fr == 1) boot_tag(1, "novafs", "fresh disk, auto-formatted");
         else              boot_tag(0, "novafs", "disk I/O error");
+        boot_tag(1, "feat",  "feature subsystem (/etc/features.conf)");
     }
 
     if (acpi_init() == 0) {
