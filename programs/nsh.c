@@ -378,7 +378,7 @@ static int exec_line(char *l, int silent)
     if (str_eq(cmd, "logout"))   { API->exit(); return 0; }
 
     /* ---- local info commands ---- */
-    if (str_eq(cmd, "date")) {
+    if (str_eq(cmd, "date") || str_eq(cmd, "time")) {
         char db[64];
         if (API->getdate(db, (u32)sizeof db) > 0) ps(db);
         return 0;

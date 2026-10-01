@@ -171,7 +171,7 @@ Welcome, root. Type 'help' for commands.
 | `about`    | 关于 NovaOS                           |
 | `echo X`   | 回显 X                               |
 | `cls`      | 清屏                                 |
-| `date`     | 日期 / 时间（CMOS RTC，带星期）      |
+| `date`     | 日期 / 时间（CMOS RTC，带星期）；`time` 同义 |
 | `mem`      | 静态内存布局                         |
 | `acpi`     | ACPI 表信息 + `\_S5` 解析结果        |
 | `reboot`   | 重启（QEMU CPU reset）               |

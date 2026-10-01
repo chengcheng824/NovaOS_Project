@@ -4,7 +4,7 @@
  * RTC CMOS read only
  * ============================================================ */
 /* Bump on every feature update (the `ver` command prints it). */
-#define NOVAOS_VERSION "v0.4"
+#define NOVAOS_VERSION "v0.4.1"
 #include "stdint.h"
 #include "ata.h"
 #include "novafs.h"
@@ -746,7 +746,7 @@ static void cmd_help(void)
     set_color(g_accent); vga_puts("  about   "); reset_color(); kputs("about NovaOS\n");
     set_color(g_accent); vga_puts("  echo X  "); reset_color(); kputs("print text\n");
     set_color(g_accent); vga_puts("  cls     "); reset_color(); kputs("clear screen\n");
-    set_color(g_accent); vga_puts("  date    "); reset_color(); kputs("date and time\n");
+    set_color(g_accent); vga_puts("  date    "); reset_color(); kputs("date and time ('time' works too)\n");
     set_color(g_accent); vga_puts("  mem     "); reset_color(); kputs("memory layout\n");
     set_color(g_accent); vga_puts("  acpi    "); reset_color(); kputs("ACPI tables + \\_S5 info\n");
     set_color(g_accent); vga_puts("  netinfo "); reset_color(); kputs("NIC status (auto-dhcp)\n");
@@ -1732,7 +1732,7 @@ static void process_cmd(void) {
     else if (str_eq(cmd, "about"))cmd_about();
     else if (str_eq(cmd, "echo")) cmd_echo(args);
     else if (str_eq(cmd, "cls"))  cmd_cls();
-    else if (str_eq(cmd, "date")) cmd_date();
+    else if (str_eq(cmd, "date") || str_eq(cmd, "time")) cmd_date();
     else if (str_eq(cmd, "mem"))  cmd_mem();
     else if (str_eq(cmd, "acpi")) cmd_acpi();
     else if (str_eq(cmd, "passwd"))cmd_passwd();
