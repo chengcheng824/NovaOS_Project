@@ -3,6 +3,8 @@
  * Features: VGA text driver, PS/2 keyboard, NovaSh shell
  * RTC CMOS read only
  * ============================================================ */
+/* Bump on every feature update (the `ver` command prints it). */
+#define NOVAOS_VERSION "v0.4"
 #include "stdint.h"
 #include "ata.h"
 #include "novafs.h"
@@ -784,7 +786,7 @@ static void cmd_help(void)
 static void cmd_ver(void)
 {
     set_color(g_accent); vga_puts("novaos"); reset_color();
-    kputs(" v0.3  (32bit)  ");
+    kputs(" " NOVAOS_VERSION "  (32bit)  ");
     set_color(C_DGRAY); vga_puts(__DATE__); reset_color(); kput('\n');
 }
 

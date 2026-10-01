@@ -389,7 +389,7 @@ static int exec_line(char *l, int silent)
         ps(ub); p('\n');
         return 0;
     }
-    if (str_eq(cmd, "ver"))   { ps("nsh v1.0 - full NovaSh in Ring3\n"); return 0; }
+    if (str_eq(cmd, "ver"))   { ps("nsh v1.1 - full NovaSh in Ring3\n"); return 0; }
     if (str_eq(cmd, "about")) {
         ps("NovaOS - a tiny 32-bit OS with preemptive multitasking\n");
         return 0;
@@ -424,7 +424,7 @@ static int exec_line(char *l, int silent)
 void nxp_main(void)
 {
     API->cls();
-    ps("nsh v1.0 - full NovaSh in Ring 3\n");
+    ps("nsh v1.1 - full NovaSh in Ring 3\n");
 
     char exp[LINE_MAX + VALLEN];
     for (;;) {
