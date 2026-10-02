@@ -4,7 +4,7 @@
  * RTC CMOS read only
  * ============================================================ */
 /* Bump on every feature update (the `ver` command prints it). */
-#define NOVAOS_VERSION "v0.4.1"
+#define NOVAOS_VERSION "v0.5"
 #include "stdint.h"
 #include "ata.h"
 #include "novafs.h"
@@ -1771,10 +1771,42 @@ static void process_cmd(void) {
     else { kputs("Unknown command: "); kputs(cmd); kputs("  (try 'help')\n"); }
 }
 
+/* ---- command history (NovaSh, ↑/↓ recall; 16 entries, ring buffer) ----
+ * The pending (not yet entered) line is saved on the first ↑ and restored
+ * when ↓ walks back past the newest entry, like mainstream shells. */
+#define HIST_N 16
+#define HIST_NAV_LIVE (-1)
+static char hist[HIST_N][CMD_MAX];
+static int  hist_count;                     /* entries stored so far      */
+static int  hist_head;                      /* index of the newest entry  */
+static int  hist_nav = HIST_NAV_LIVE;       /* -1 = live edit, else age   */
+static char hist_draft[CMD_MAX];            /* line being edited pre-↑    */
+
+static void hist_push(const char *line)
+{
+    if (!line[0]) return;
+    if (hist_count && str_eq(hist[hist_head], line)) return;   /* dedup */
+    hist_head = (hist_head + 1) % HIST_N;
+    int i = 0;
+    for (; line[i] && i < CMD_MAX - 1; i++) hist[hist_head][i] = line[i];
+    hist[hist_head][i] = 0;
+    if (hist_count < HIST_N) hist_count++;
+}
+
+/* load history entry `nav` (0 = newest) into line */
+static void hist_load(int nav, char *line)
+{
+    int idx = (hist_head - nav + HIST_N) % HIST_N;
+    int i = 0;
+    for (; hist[idx][i] && i < CMD_MAX - 1; i++) line[i] = hist[idx][i];
+    line[i] = 0;
+}
+
 static void shell_run(void) {
     for (;;) {
         int cmdcur = 0;                          /* cursor inside cmdline */
         cmdlen = 0;
+        hist_nav = HIST_NAV_LIVE;
         shell_prompt();
         for (;;) {
             char c = kb_read();
@@ -1782,6 +1814,40 @@ static void shell_run(void) {
                 if (cmdcur > 0) { cmdcur--; kput('\v'); }
             } else if (c == K_RIGHT) {           /* cursor right */
                 if (cmdcur < cmdlen) { kput(cmdline[cmdcur]); cmdcur++; }
+            } else if (c == K_UP || c == K_DOWN) {   /* history recall */
+                int want = hist_nav + ((c == K_UP) ? 1 : -1);
+                char buf[CMD_MAX];
+                int ok = 0;
+                if (c == K_UP && want < hist_count) {
+                    if (hist_nav == HIST_NAV_LIVE) {         /* stash draft */
+                        for (int i = 0; i < cmdlen; i++) hist_draft[i] = cmdline[i];
+                        hist_draft[cmdlen] = 0;
+                    }
+                    hist_load(want, buf);
+                    hist_nav = want;
+                    ok = 1;
+                } else if (c == K_DOWN && hist_nav > HIST_NAV_LIVE) {
+                    hist_nav--;
+                    if (hist_nav == HIST_NAV_LIVE) {
+                        int i = 0;
+                        while (hist_draft[i] && i < CMD_MAX - 1) { buf[i] = hist_draft[i]; i++; }
+                        buf[i] = 0;
+                    } else hist_load(hist_nav, buf);
+                    ok = 1;
+                }
+                if (ok) {
+                    /* replace the whole line: to col 0, write the new text,
+                     * blank any leftover tail, cursor ends at the new tail */
+                    for (int i = 0; i < cmdlen; i++) kput('\v');
+                    int nl = str_len(buf);
+                    for (int i = 0; i < nl; i++) kput(buf[i]);
+                    for (int i = nl; i < cmdlen; i++) kput(' ');
+                    for (int i = nl; i < cmdlen; i++) kput('\v');
+                    for (int i = 0; i < nl; i++) cmdline[i] = buf[i];
+                    cmdline[nl] = 0;
+                    cmdlen = nl;
+                    cmdcur = nl;
+                }
             } else if (c == '\n') { kput('\n'); break; }
             else if (c == '\b') {                /* delete before cursor */
                 if (cmdcur > 0) {
@@ -1798,6 +1864,7 @@ static void shell_run(void) {
                 for (int i = cmdcur; i < cmdlen; i++) kput('\v');
             }
         }
+        hist_push(cmdline);
         process_cmd();
         if (g_logout) return;                    /* back to login */
     }

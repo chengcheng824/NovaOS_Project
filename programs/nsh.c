@@ -421,16 +421,43 @@ static int exec_line(char *l, int silent)
     return 0;
 }
 
+/* command history (↑/↓ recall, same behavior as the kernel NovaSh) */
+#define HIST_N 16
+#define HIST_NAV_LIVE (-1)
+static char hist[HIST_N][LINE_MAX];
+static int  hist_count, hist_head, hist_nav = HIST_NAV_LIVE;
+static char hist_draft[LINE_MAX];
+
+static void hist_push(const char *l)
+{
+    if (!l[0]) return;
+    if (hist_count && str_eq(hist[hist_head], l)) return;
+    hist_head = (hist_head + 1) % HIST_N;
+    int i = 0;
+    for (; l[i] && i < LINE_MAX - 1; i++) hist[hist_head][i] = l[i];
+    hist[hist_head][i] = 0;
+    if (hist_count < HIST_N) hist_count++;
+}
+
+static void hist_load(int nav, char *l)
+{
+    int idx = (hist_head - nav + HIST_N) % HIST_N;
+    int i = 0;
+    for (; hist[idx][i] && i < LINE_MAX - 1; i++) l[i] = hist[idx][i];
+    l[i] = 0;
+}
+
 void nxp_main(void)
 {
     API->cls();
-    ps("nsh v1.1 - full NovaSh in Ring 3\n");
+    ps("nsh v1.2 - full NovaSh in Ring 3\n");
 
     char exp[LINE_MAX + VALLEN];
     for (;;) {
         int len = 0;
         int cur = 0;                                /* cursor inside line */
         char user[32];
+        hist_nav = HIST_NAV_LIVE;
         API->getuser(user, (u32)sizeof user);
         p('\n');
         ps(user);
@@ -442,6 +469,39 @@ void nxp_main(void)
                 if (cur > 0) { cur--; p('\v'); }
             } else if (c == NXP_KEY_RIGHT) {        /* cursor right */
                 if (cur < len) { p(line[cur]); cur++; }
+            } else if (c == NXP_KEY_UP || c == NXP_KEY_DOWN) {   /* history */
+                int want = hist_nav + ((c == NXP_KEY_UP) ? 1 : -1);
+                char buf[LINE_MAX];
+                int ok = 0;
+                if (c == NXP_KEY_UP && want < hist_count) {
+                    if (hist_nav == HIST_NAV_LIVE) {
+                        for (int i = 0; i < len; i++) hist_draft[i] = line[i];
+                        hist_draft[len] = 0;
+                    }
+                    hist_load(want, buf);
+                    hist_nav = want;
+                    ok = 1;
+                } else if (c == NXP_KEY_DOWN && hist_nav > HIST_NAV_LIVE) {
+                    hist_nav--;
+                    if (hist_nav == HIST_NAV_LIVE) {
+                        int i = 0;
+                        while (hist_draft[i] && i < LINE_MAX - 1) { buf[i] = hist_draft[i]; i++; }
+                        buf[i] = 0;
+                    } else hist_load(hist_nav, buf);
+                    ok = 1;
+                }
+                if (ok) {
+                    for (int i = 0; i < len; i++) p('\v');
+                    int nl = 0;
+                    while (buf[nl]) nl++;
+                    for (int i = 0; i < nl; i++) p(buf[i]);
+                    for (int i = nl; i < len; i++) p(' ');
+                    for (int i = nl; i < len; i++) p('\v');
+                    for (int i = 0; i < nl; i++) line[i] = buf[i];
+                    line[nl] = 0;
+                    len = nl;
+                    cur = nl;
+                }
             } else if (c == '\n') { p('\n'); break; }
             else if (c == '\b') {                   /* delete before cursor */
                 if (cur > 0) {
@@ -457,6 +517,7 @@ void nxp_main(void)
             }
         }
         line[len] = 0;
+        hist_push(line);
         expand(line, exp);
         exec_line(exp, 1);          /* input loop already echoed the typing */
     }
