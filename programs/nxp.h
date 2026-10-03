@@ -23,10 +23,11 @@ typedef struct {
     void (*fill_rect)(u32 x, u32 y, u32 w, u32 h, u32 rgb);
     void (*text)(u32 x, u32 y, const char *s, u32 rgb);   /* 8x16 font */
     int  (*getkey)(void);          /* non-blocking: -1 = no key */
-    /* accumulated mouse deltas since the last call (screen convention:
-     * +x right, +y down). btns: bit0=L bit1=R bit2=M. Returns the number
-     * of packets consumed (0 = no movement). */
-    int  (*mouse)(int *dx, int *dy, int *btns);
+    /* accumulated deltas since the last call (screen convention:
+     * +x right, +y down). btns: bit0=L bit1=R bit2=M. wheel: notches
+     * since last call, +1 = up, -1 = down (always 0 without a wheel).
+     * Returns the number of packets consumed (0 = no movement). */
+    int  (*mouse)(int *dx, int *dy, int *btns, int *wheel);
     u32 (*get_pixel)(u32 x, u32 y);     /* read a pixel (software cursors) */
     void (*cls)(void);                   /* clear screen + home cursor       */
     void (*set_color)(u32 fg);           /* VGA attr foreground (see below)   */

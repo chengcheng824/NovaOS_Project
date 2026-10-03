@@ -429,10 +429,11 @@ static void files_draw(void)
         int bar = (sel && s_selbar);            /* accent-bar selection */
         API->cellfill(LX + 1, rowy, LW - 2, 1,
                       ((u32)' ' << 8) | (sel ? (bar ? A_TXT : A_SEL) : A_TXT));
-        if (bar) API->putcell(LX + 2, rowy, NXP_CH_BLOCK, acc());
+        if (sel) API->putcell(LX + 2, rowy, NXP_CH_BLOCK,
+                              bar ? acc() : acc_sel());   /* block = selected row */
         else API->putcell(LX + 2, rowy,
                           f_dir[idx] ? NXP_CH_RARROW : NXP_CH_DOT,
-                          sel ? acc_sel() : (f_dir[idx] ? acc() : A_DIM));
+                          f_dir[idx] ? acc() : A_DIM);
         API->cputs(LX + 4, rowy, f_name[idx],
                    sel ? A_SEL : (f_dir[idx] ? acc() : A_TXT));
         if (!f_dir[idx]) {
@@ -771,6 +772,21 @@ void nxp_main(void)
     for (;;) {
         int c = API->getkey();
         if (c < 0) {
+            /* wheel scrolls the file list (and the Tasks selection) */
+            int mdx, mdy, mb, mw;
+            if (API->mouse(&mdx, &mdy, &mb, &mw) && mw) {
+                if (g_tab == 0 && f_n) {
+                    f_sel += mw;                       /* +up / -down */
+                    if (f_sel < 0) f_sel = 0;
+                    if (f_sel > f_n - 1) f_sel = f_n - 1;
+                    files_draw();
+                } else if (g_tab == 1 && t_n) {
+                    t_sel += mw;
+                    if (t_sel < 0) t_sel = 0;
+                    if (t_sel > t_n - 1) t_sel = t_n - 1;
+                    tasks_draw();
+                }
+            }
             u32 sec = API->ticks() / 100;
             if (sec != last_sec) {              /* 1 Hz: clock + tasks refresh */
                 last_sec = sec;

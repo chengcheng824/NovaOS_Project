@@ -4,7 +4,7 @@
  * RTC CMOS read only
  * ============================================================ */
 /* Bump on every feature update (the `ver` command prints it). */
-#define NOVAOS_VERSION "v0.6"
+#define NOVAOS_VERSION "v0.7"
 #include "stdint.h"
 #include "ata.h"
 #include "novafs.h"
@@ -326,17 +326,20 @@ static char kb_read(void)
  * ============================================================ */
 #define AUX_TAG 0x20
 
-static uint8_t mpkt[3];
+static uint8_t mpkt[4];
 static int     mpkt_state;
 static int     mouse_dx, mouse_dy;    /* accumulated deltas */
 static int     mouse_btns;            /* 1=L 2=R 4=M */
+static int     mouse_wheel;           /* accumulated notches: +up / -down */
 static int     mouse_pkts;            /* packets pending for the app */
+static int     mouse_wheel_on;        /* 4-byte packets after ID probe = 3 */
 
 static void mouse_feed(uint8_t b)
 {
     if (mpkt_state == 0 && !(b & 0x08)) return;   /* resync on flags byte */
     mpkt[mpkt_state++] = b;
-    if (mpkt_state == 3) {
+    int plen = mouse_wheel_on ? 4 : 3;
+    if (mpkt_state == plen) {
         mpkt_state = 0;
         int dx = mpkt[1], dy = mpkt[2];
         if (mpkt[0] & 0x10) dx -= 256;
@@ -344,6 +347,11 @@ static void mouse_feed(uint8_t b)
         mouse_dx += dx;
         mouse_dy -= dy;                          /* PS/2 +y is up, screen +y is down */
         mouse_btns = mpkt[0] & 7;
+        if (mouse_wheel_on) {
+            int w = mpkt[3] & 0x0F;              /* signed 4-bit wheel notch */
+            if (w >= 8) w -= 16;
+            mouse_wheel += w;                    /* +1 = up, -1 = down */
+        }
         mouse_pkts++;
     }
 }
@@ -417,6 +425,12 @@ static int mouse_cmd(uint8_t b)
     (void)st;                       /* the 0xFA ack is not packet data - never feed it */
     return (ack == 0xFA) ? 0 : -1;
 }
+/* read one spontaneous device byte (e.g. the 0xF2 ID reply) */
+static int mouse_read_byte(void)
+{
+    if (mouse_wait(0) < 0) return -1;
+    return inb(KB_DATA);
+}
 static int mouse_init(void)
 {
     if (mouse_wait(1) < 0) return -1;  outb(0x64, 0xA8);      /* enable aux */
@@ -428,6 +442,19 @@ static int mouse_init(void)
     if (mouse_wait(1) < 0) return -1;  outb(0x64, 0x60);
     if (mouse_wait(1) < 0) return -1;  outb(0x60, cfg);
     if (mouse_cmd(0xF6) < 0) return -1;                          /* defaults */
+    /* IntelliMouse wheel enable: sample rates 200,100,80 then read ID.
+     * QEMU's PS/2 device answers ID 3 and switches to 4-byte packets. */
+    mouse_wheel_on = 0;
+    if (mouse_cmd(0xF3) == 0 && mouse_cmd(200) == 0 &&
+        mouse_cmd(0xF3) == 0 && mouse_cmd(100) == 0 &&
+        mouse_cmd(0xF3) == 0 && mouse_cmd(80)  == 0 &&
+        mouse_cmd(0xF2) == 0) {
+        int id = mouse_read_byte();
+        if (id == 3) mouse_wheel_on = 1;
+        serial_puts("[mouse] id=");
+        serial_putc((char)('0' + (id >= 0 && id <= 9 ? id : 0)));
+        serial_puts(mouse_wheel_on ? " wheel on\n" : " (no wheel)\n");
+    }
     if (mouse_cmd(0xF4) < 0) return -1;                          /* streaming */
     mpkt_state = 0;                                              /* start on a packet boundary */
     return 0;
@@ -913,7 +940,8 @@ typedef struct {
     void (*fill_rect)(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t rgb);
     void (*text)(uint32_t x, uint32_t y, const char *s, uint32_t rgb);
     int  (*getkey)(void);           /* non-blocking: -1 = no key */
-    int  (*mouse)(int *dx, int *dy, int *btns);  /* deltas since last call */
+    int  (*mouse)(int *dx, int *dy, int *btns, int *wheel);
+                                                  /* deltas + wheel notches */
     uint32_t (*get_pixel)(uint32_t x, uint32_t y);   /* for XOR cursors */
     void (*cls)(void);                              /* clear screen */
     void (*set_color)(uint32_t fg);                 /* VGA attr foreground */
@@ -960,14 +988,15 @@ static uint32_t nxp_api_getpixel(uint32_t x, uint32_t y)
 {
     return gfx_active() ? gfx_pixel_get((int)x, (int)y) : 0;
 }
-static int nxp_api_mouse(int *dx, int *dy, int *btns)
+static int nxp_api_mouse(int *dx, int *dy, int *btns, int *wheel)
 {
     ps2_drain();
     int n = mouse_pkts;
     if (dx)   *dx   = mouse_dx;
     if (dy)   *dy   = mouse_dy;
     if (btns) *btns = mouse_btns;
-    mouse_dx = mouse_dy = mouse_pkts = 0;
+    if (wheel) *wheel = mouse_wheel;
+    mouse_dx = mouse_dy = mouse_wheel = mouse_pkts = 0;
     return n;
 }
 static void nxp_api_cls(void)                  { vga_clear(); }

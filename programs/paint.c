@@ -74,8 +74,8 @@ void nxp_main(void)
 
     for (;;) {
         /* ---- mouse ---- */
-        int mdx, mdy, mb;
-        if (API->mouse(&mdx, &mdy, &mb)) {
+        int mdx, mdy, mb, mw;
+        if (API->mouse(&mdx, &mdy, &mb, &mw)) {
             if (shown) { cursor_xor(x, y); shown = 0; }  /* lift at old pos */
             int px0 = x, py0 = y;
             x += mdx; y += mdy;

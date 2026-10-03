@@ -323,7 +323,7 @@ void syscall_dispatch(regs_t *r)
     case SYS_CURSOR:   g_api->cursor(a[0], 0, 0, 0, 0); break;
     case SYS_GETKEY:   ret = g_api->getkey(0, 0, 0, 0, 0); break;
     case SYS_MOUSE:
-        ret = g_api->mouse(uptr(a[0]), uptr(a[1]), uptr(a[2]), 0, 0);
+        ret = g_api->mouse(uptr(a[0]), uptr(a[1]), uptr(a[2]), uptr(a[3]), 0);
         break;
     case SYS_GETPIXEL: ret = g_api->get_pixel(a[0], a[1], 0, 0, 0); break;
     case SYS_CLS:      g_api->cls(0, 0, 0, 0, 0); break;
@@ -521,7 +521,7 @@ static uint8_t *emit_stub(uint8_t *p, uint32_t sysno, int nargs)
 
 void ring3_setup_tramp(void)
 {
-    static const uint8_t nargs[SYS_COUNT] = { 1,1,0,0,3,5,4,0,3,2, 0,1,2,2,3,1,2,3, 2,2,2,0,
+    static const uint8_t nargs[SYS_COUNT] = { 1,1,0,0,3,5,4,0,4,2, 0,1,2,2,3,1,2,3, 2,2,2,0,
                                               4,5,4,1 };
     uint8_t *p = (uint8_t *)NXP_TRAMP_BASE;
     uint32_t stub[SYS_COUNT];
