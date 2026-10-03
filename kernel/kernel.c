@@ -4,7 +4,7 @@
  * RTC CMOS read only
  * ============================================================ */
 /* Bump on every feature update (the `ver` command prints it). */
-#define NOVAOS_VERSION "v0.7"
+#define NOVAOS_VERSION "v0.7.1"
 #include "stdint.h"
 #include "ata.h"
 #include "novafs.h"
@@ -2526,8 +2526,12 @@ void kmain(void) {
     }
     int mse = mouse_init();
     if (!g_quiet) {
-        boot_tag(mse == 0, "input",  mse == 0 ? "keyboard + PS/2 mouse"
-                                              : "keyboard (no aux mouse)");
+        if (mse == 0) {
+            boot_tag(1, "input", mouse_wheel_on ? "keyboard + PS/2 mouse + wheel"
+                                                : "keyboard + PS/2 mouse");
+        } else {
+            boot_tag(0, "input", "keyboard (no aux mouse)");
+        }
     }
     ring3_init(&nxp_api);
     if (!g_quiet) boot_tag(1, "ring3", "paging + TSS + IDT, user mode ready");
