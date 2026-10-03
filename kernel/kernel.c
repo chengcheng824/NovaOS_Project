@@ -4,7 +4,7 @@
  * RTC CMOS read only
  * ============================================================ */
 /* Bump on every feature update (the `ver` command prints it). */
-#define NOVAOS_VERSION "v0.5"
+#define NOVAOS_VERSION "v0.6"
 #include "stdint.h"
 #include "ata.h"
 #include "novafs.h"
@@ -252,13 +252,13 @@ static int str_len(const char *s)
 #define KB_DATA 0x60
 #define KB_STAT 0x64
 static const char scancode_map[128] = {
-    0,0,'1','2','3','4','5','6','7','8','9','0','-','=', '\b',0,
+    0,0,'1','2','3','4','5','6','7','8','9','0','-','=', '\b','\t',
     'q','w','e','r','t','y','u','i','o','p','[',']','\n',0,
     'a','s','d','f','g','h','j','k','l',';','\'','`',0,'\\',
     'z','x','c','v','b','n','m',',','.','/',0,'*',0,' ',0,
 };
 static const char shift_map[128] = {
-    0,0,'!','@','#','$','%','^','&','*','(',')','_','+','\b',0,
+    0,0,'!','@','#','$','%','^','&','*','(',')','_','+','\b','\t',
     'Q','W','E','R','T','Y','U','I','O','P','{','}','\n',0,
     'A','S','D','F','G','H','J','K','L',':','"','~',0,'|',
     'Z','X','C','V','B','N','M','<','>','?',0,'*',0,' ',0,
@@ -742,6 +742,7 @@ static void cmd_help(void)
 {
     set_color(C_DGRAY); vga_puts(" --- commands ---\n"); reset_color();
     set_color(g_accent); vga_puts("  help    "); reset_color(); kputs("show this help\n");
+    set_color(C_DGRAY); kputs("          Tab completes commands and filenames\n"); reset_color();
     set_color(g_accent); vga_puts("  ver     "); reset_color(); kputs("kernel version\n");
     set_color(g_accent); vga_puts("  about   "); reset_color(); kputs("about NovaOS\n");
     set_color(g_accent); vga_puts("  echo X  "); reset_color(); kputs("print text\n");
@@ -1802,6 +1803,122 @@ static void hist_load(int nav, char *line)
     line[i] = 0;
 }
 
+/* ---- tab completion: word 1 completes command names, later words
+ * complete entries of the cwd. One match -> full completion (a '/-'
+ * suffix marks a completed directory); several -> longest common prefix;
+ * no match -> no-op. Returns the number of chars inserted (0 = none). */
+static const char * const cmd_tab[] = {
+    "help","ver","about","echo","cls","date","time","mem","acpi",
+    "netinfo","dhcp","ping","dns","wget","udpecho","ls","cd","mkdir",
+    "rmdir","rd","cat","write","rm","chmod","feature","feture","run",
+    "procs","ps","fg","kill","mkdemo","format","fsinfo","passwd",
+    "useradd","userdel","su","whoami","logout","reboot","shutdown","halt",0
+};
+
+#define TAB_MATCH 64
+static char tab_names[TAB_MATCH][FS_NAME_LEN];
+static int  tab_isdir[TAB_MATCH];
+static int  tab_n;
+
+static void tab_collect_cb(const char *name, int type, uint32_t size, uint8_t mode);
+
+static void tab_collect_files(void)
+{
+    tab_n = 0;
+    if (!fs_is_ready()) return;
+    fs_list(tab_collect_cb);
+}
+static void tab_collect_cb(const char *name, int type, uint32_t size, uint8_t mode)
+{
+    (void)size; (void)mode;
+    if (tab_n >= TAB_MATCH) return;
+    int i = 0;
+    for (; name[i] && i < FS_NAME_LEN - 1; i++) tab_names[tab_n][i] = name[i];
+    tab_names[tab_n][i] = 0;
+    tab_isdir[tab_n] = (type == T_DIR);
+    tab_n++;
+}
+
+static int tab_complete(char *line, int *lenp, int *curp)
+{
+    int start = *curp;
+    while (start > 0 && line[start - 1] != ' ') start--;
+    int wlen = *curp - start;
+    if (wlen >= FS_NAME_LEN - 1) return 0;
+
+    /* pick the candidate pool */
+    const char * const *cmds = 0;
+    if (start == 0) cmds = cmd_tab;
+    else {
+        for (int i = 0; i < tab_n; i++) tab_names[i][0] = 0;
+        tab_n = 0;
+        tab_collect_files();
+    }
+
+    /* gather prefix matches + longest common prefix */
+    int nm = 0, lcp = FS_NAME_LEN;
+    char cand[FS_NAME_LEN];
+    for (int i = 0; ; i++) {
+        const char *c = cmds ? cmds[i] : (i < tab_n ? tab_names[i] : 0);
+        if (!c) break;
+        int k = 0;
+        while (k < wlen && c[k] && c[k] == line[start + k]) k++;
+        if (k < wlen) continue;                 /* prefix mismatch */
+        if (nm < TAB_MATCH) {
+            int j = 0;
+            while (c[j] && j < FS_NAME_LEN - 1) { cand[j] = c[j]; j++; }
+            cand[j] = 0;
+            for (int q = 0; q < j; q++) tab_names[nm][q] = cand[q];
+            tab_names[nm][j] = 0;
+            tab_isdir[nm] = cmds ? 0 : tab_isdir[i];
+        }
+        nm++;
+        int cl = 0;
+        while (c[cl]) cl++;
+        if (cl < lcp) lcp = cl;
+    }
+    if (nm == 0) return 0;
+
+    /* how much can we add: unique match -> all of it (+ '/' or ' ');
+     * several -> longest common prefix beyond the typed part */
+    int add = 0;
+    char ins[FS_NAME_LEN + 2];
+    if (nm == 1) {
+        int cl = 0;
+        while (tab_names[0][cl]) cl++;
+        for (int q = wlen; q < cl; q++) ins[add++] = tab_names[0][q];
+        ins[add++] = (tab_isdir[0] && !cmds) ? '/' : ' ';
+    } else {
+        int best = wlen;
+        for (int q = wlen; q < lcp; q++) {
+            char ref = 0;
+            int same = 1;
+            for (int m = 0; m < nm && m < TAB_MATCH; m++) {
+                char ch = (m == 0) ? tab_names[0][q] : tab_names[m][q];
+                if (m == 0) { ref = ch; continue; }
+                if (ch != ref) { same = 0; break; }
+            }
+            if (!same || !ref) break;
+            best = q + 1;
+        }
+        if (best <= wlen) return 0;
+        /* rebuild the shared prefix from the first match */
+        for (int q = wlen; q < best; q++) ins[add++] = tab_names[0][q];
+    }
+    if (add <= 0) return 0;
+
+    /* insert at the cursor (same shift-insert + tail redraw as typing) */
+    if (*lenp + add > CMD_MAX - 1) add = CMD_MAX - 1 - *lenp;
+    for (int i = *lenp; i >= *curp; i--) line[i + add] = line[i];
+    for (int i = 0; i < add; i++) line[*curp + i] = ins[i];
+    *lenp += add;
+    for (int i = 0; i < add; i++) { kput(ins[i]); }
+    *curp += add;
+    for (int i = *curp; i < *lenp; i++) kput(line[i]);
+    for (int i = *curp; i < *lenp; i++) kput('\v');
+    return add;
+}
+
 static void shell_run(void) {
     for (;;) {
         int cmdcur = 0;                          /* cursor inside cmdline */
@@ -1848,6 +1965,8 @@ static void shell_run(void) {
                     cmdlen = nl;
                     cmdcur = nl;
                 }
+            } else if (c == '\t') {              /* tab completion */
+                tab_complete(cmdline, &cmdlen, &cmdcur);
             } else if (c == '\n') { kput('\n'); break; }
             else if (c == '\b') {                /* delete before cursor */
                 if (cmdcur > 0) {

@@ -447,6 +447,144 @@ static void hist_load(int nav, char *l)
     l[i] = 0;
 }
 
+/* ---- tab completion (same rules as the kernel NovaSh) ---- */
+static const char * const cmd_tab[] = {
+    "help","ver","about","echo","cls","date","time","whoami","mem","exit",
+    "logout","ls","cd","mkdir","rmdir","rd","rm","cat","write","format",
+    "fsinfo","mkdemo","useradd","userdel","su","passwd","acpi","reboot",
+    "shutdown","halt","netinfo","dhcp","ping","dns","wget","udpecho",
+    "feature","feture","run","procs","fg","kill","pause","set","if","goto",
+    "rem",0
+};
+
+#define TAB_MATCH 64
+static char tab_names[TAB_MATCH][26];
+static int  tab_isdir[TAB_MATCH];
+static int  tab_n;
+
+static int tab_collect_cb(const char *name, int type, u32 size)
+{
+    (void)size;
+    if (tab_n < TAB_MATCH) {
+        int i = 0;
+        while (name[i] && i < 25) { tab_names[tab_n][i] = name[i]; i++; }
+        tab_names[tab_n][i] = 0;
+        tab_isdir[tab_n] = (type == 2);         /* T_DIR */
+        tab_n++;
+    }
+    return 0;
+}
+
+static int tab_complete(char *line, int *lenp, int *curp)
+{
+    int start = *curp;
+    while (start > 0 && line[start - 1] != ' ') start--;
+    int wlen = *curp - start;
+    if (wlen >= 24) return 0;
+
+    const char * const *cmds = 0;
+    if (start == 0) cmds = cmd_tab;
+    else {
+        tab_n = 0;
+        static char lb[2048];                   /* stack: syscall buffer */
+        char *sp = lb;
+        API->listdir(sp, (u32)sizeof lb);
+        /* reuse the shell's own ls parse: walk lines, pull names */
+        const char *q = sp;
+        while (*q && tab_n < TAB_MATCH) {
+            if (q[0] == ' ' && q[1] == ' ' && q[2] == '[' &&
+                (q[3] == 'D' || q[3] == 'F')) {
+                int isd = (q[3] == 'D');
+                const char *s = q + 16;         /* tag(9) + mode(6) + space(1) */
+                int k = 0;
+                while (*s && *s != '\n' && *s != '(' && k < 25)
+                    { tab_names[tab_n][k++] = *s++; }
+                while (k > 0 && tab_names[tab_n][k-1] == ' ') k--;
+                tab_names[tab_n][k] = 0;
+                tab_isdir[tab_n] = isd;
+                tab_n++;
+            }
+            while (*q && *q != '\n') q++;
+            if (*q) q++;
+        }
+    }
+
+    int nm = 0, lcp = 26;
+    for (int i = 0; ; i++) {
+        const char *c = cmds ? cmds[i] : (i < tab_n ? tab_names[i] : 0);
+        if (!c) break;
+        int k = 0;
+        while (k < wlen && c[k] && c[k] == line[start + k]) k++;
+        if (k < wlen) continue;
+        nm++;
+        int cl = 0;
+        while (c[cl]) cl++;
+        if (cl < lcp) lcp = cl;
+    }
+    if (nm == 0) return 0;
+
+    char ins[28];
+    int add = 0;
+    if (nm == 1) {
+        const char *c = 0;
+        int mi = -1;
+        if (cmds) {
+            for (int i = 0; cmd_tab[i]; i++) {
+                int k = 0;
+                while (k < wlen && cmd_tab[i][k] && cmd_tab[i][k] == line[start + k]) k++;
+                if (k < wlen) continue;
+                c = cmd_tab[i];
+                break;
+            }
+        } else {
+            for (int i = 0; i < tab_n; i++) {
+                int k = 0;
+                while (k < wlen && tab_names[i][k] && tab_names[i][k] == line[start + k]) k++;
+                if (k < wlen) continue;
+                c = tab_names[i];
+                mi = i;
+                break;
+            }
+        }
+        if (!c) return 0;
+        int cl = 0;
+        while (c[cl]) cl++;
+        for (int q = wlen; q < cl && add < 26; q++) ins[add++] = c[q];
+        ins[add++] = (!cmds && mi >= 0 && tab_isdir[mi]) ? '/' : ' ';
+    } else {
+        int best = wlen;
+        for (int q = wlen; q < lcp; q++) {
+            char ref = 0;
+            int seen = 0, same = 1;
+            for (int i = 0; ; i++) {
+                const char *c = cmds ? cmds[i] : (i < tab_n ? tab_names[i] : 0);
+                if (!c) break;
+                if (!c[q]) { same = 0; break; }
+                if (!seen) { ref = c[q]; seen = 1; }
+                else if (c[q] != ref) { same = 0; break; }
+            }
+            if (!same || !ref) break;
+            best = q + 1;
+        }
+        if (best <= wlen) return 0;
+        /* copy the shared prefix from the first match */
+        for (int i = 0; ; i++) {
+            const char *c = cmds ? cmds[i] : (i < tab_n ? tab_names[i] : 0);
+            if (!c) break;
+            for (int q = wlen; q < best && add < 26; q++) ins[add++] = c[q];
+            break;
+        }
+    }
+    if (add <= 0 || *lenp + add > LINE_MAX - 1) return 0;
+    for (int i = *lenp; i >= *curp; i--) line[i + add] = line[i];
+    for (int i = 0; i < add; i++) line[*curp + i] = ins[i];
+    *lenp += add;
+    for (int i = 0; i < add; i++) p(ins[i]);
+    *curp += add;
+    retail(*curp, *lenp);
+    return add;
+}
+
 void nxp_main(void)
 {
     API->cls();
@@ -502,6 +640,8 @@ void nxp_main(void)
                     len = nl;
                     cur = nl;
                 }
+            } else if (c == '\t') {                 /* tab completion */
+                tab_complete(line, &len, &cur);
             } else if (c == '\n') { p('\n'); break; }
             else if (c == '\b') {                   /* delete before cursor */
                 if (cur > 0) {
