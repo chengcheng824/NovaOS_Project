@@ -4,7 +4,7 @@
  * RTC CMOS read only
  * ============================================================ */
 /* Bump on every feature update (the `ver` command prints it). */
-#define NOVAOS_VERSION "v0.7.1"
+#define NOVAOS_VERSION "v0.7.2"
 #include "stdint.h"
 #include "ata.h"
 #include "novafs.h"
@@ -350,6 +350,11 @@ static void mouse_feed(uint8_t b)
         if (mouse_wheel_on) {
             int w = mpkt[3] & 0x0F;              /* signed 4-bit wheel notch */
             if (w >= 8) w -= 16;
+            if (w) {                             /* serial debug: wheel seen */
+                serial_puts("[w] ");
+                serial_putc(w > 0 ? '+' : '-');
+                serial_puts("1\n");
+            }
             mouse_wheel += w;                    /* +1 = up, -1 = down */
         }
         mouse_pkts++;
