@@ -4,7 +4,7 @@
  * RTC CMOS read only
  * ============================================================ */
 /* Bump on every feature update (the `ver` command prints it). */
-#define NOVAOS_VERSION "v0.7.3"
+#define NOVAOS_VERSION "v0.8"
 #include "stdint.h"
 #include "ata.h"
 #include "novafs.h"
@@ -201,14 +201,14 @@ static void serial_init(void)
     outb(COM1 + 3, 0x03); outb(COM1 + 2, 0xC7); outb(COM1 + 4, 0x0B);
 }
 
-static void serial_putc(char c)
+void serial_putc(char c)
 {
     int timeout = 100000;
     while (!(inb(COM1 + 5) & 0x20) && --timeout) ;
     outb(COM1, (uint8_t)c);
 }
 
-static void serial_puts(const char *s)
+void serial_puts(const char *s)
 {
     while (*s) serial_putc(*s++);
 }
@@ -1960,7 +1960,15 @@ static void shell_run(void) {
         hist_nav = HIST_NAV_LIVE;
         shell_prompt();
         for (;;) {
-            char c = kb_read();
+            ps2_drain();
+            if (mouse_wheel) {                   /* wheel: scroll the screen */
+                if (gfx_active()) gfx_sb_scroll(mouse_wheel);
+                mouse_wheel = 0;
+            }
+            int kc = kb_poll();
+            if (kc < 0) continue;
+            if (gfx_active()) gfx_sb_scroll(0);  /* any key: back to live */
+            char c = (char)kc;
             if (c == K_LEFT) {                   /* cursor left (no erase) */
                 if (cmdcur > 0) { cmdcur--; kput('\v'); }
             } else if (c == K_RIGHT) {           /* cursor right */

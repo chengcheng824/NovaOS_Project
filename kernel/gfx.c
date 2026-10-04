@@ -148,6 +148,109 @@ static uint8_t fg_idx_cur = 7, bg_idx_cur = 0;
 static uint32_t fg_col = pal[7], bg_col = pal[0];
 static int gfx_on = 0;
 
+/* ---- scrollback: cell mirror of the live screen + ring of scrolled-off
+ * lines. Packed cell = (bg<<12)|(fg<<8)|char. The wheel (kernel shell)
+ * views older lines; any key returns to the live view. VGA text fallback
+ * has no scrollback (gfx-only feature). ---- */
+#define SB_N     100            /* remembered off-screen lines */
+#define SB_COLS  128
+#define SB_PACK(fg, bg, ch) ((unsigned short)((bg) << 12 | (fg) << 8 | (unsigned char)(ch)))
+#define SB_CH(c)   ((char)((c) & 0xFF))
+#define SB_FG(c)   ((uint8_t)(((c) >> 8) & 0xF))
+#define SB_BG(c)   ((uint8_t)(((c) >> 12) & 0xF))
+static unsigned short sb_ring[SB_N][SB_COLS];   /* scrolled-off lines */
+static int sb_count;                            /* valid ring entries */
+static int sb_head;                             /* ring index of newest */
+static unsigned short sb_view[48][SB_COLS];     /* live screen mirror */
+static unsigned short sb_blank[SB_COLS];        /* older-than-memory rows */
+static int sb_off;                              /* 0 = live, N = N lines up */
+
+static inline void px(int x, int y, uint32_t c);
+extern void serial_puts(const char *s);
+extern void serial_putc(char c);
+
+static void sb_clear_tail(int cy, int from_x);
+static void sb_push_top(void)
+{
+    sb_head = (sb_head + 1) % SB_N;
+    for (int c = 0; c < SB_COLS; c++) sb_ring[sb_head][c] = sb_view[0][c];
+    if (sb_count < SB_N) sb_count++;
+    for (int r = 1; r < 48; r++)
+        for (int c = 0; c < SB_COLS; c++) sb_view[r - 1][c] = sb_view[r][c];
+    sb_clear_tail(47, 0);                        /* scrolled-in row is blank */
+}
+
+static void sb_capture(int cx, int cy, char ch)
+{
+    if (cx < 0 || cx >= SB_COLS || cy < 0 || cy >= 48) return;
+    sb_view[cy][cx] = SB_PACK(fg_idx_cur, bg_idx_cur, ch);
+}
+
+/* blank the tail of a mirror row from cx (line complete on newline) */
+static void sb_clear_tail(int cy, int from_x)
+{
+    if (cy < 0 || cy >= 48) return;
+    for (int cx = from_x; cx < SB_COLS; cx++)
+        sb_view[cy][cx] = SB_PACK(fg_idx_cur, bg_idx_cur, ' ');
+}
+
+static void sb_blit_line(int row, const unsigned short *cells)
+{
+    int px_y = row * GLYPH_H;
+    for (int cx = 0; cx < con_cols && cx < SB_COLS; cx++) {
+        unsigned short cell = cells[cx];
+        const uint8_t *g = font[(unsigned char)SB_CH(cell)];
+        uint32_t fg = pal[SB_FG(cell)], bg = pal[SB_BG(cell)];
+        int px_x = cx * GLYPH_W;
+        for (int r = 0; r < GLYPH_H; r++) {
+            uint8_t bits = g[r];
+            for (int b = 0; b < GLYPH_W; b++)
+                px(px_x + b, px_y + r, (bits & (0x80 >> b)) ? fg : bg);
+        }
+    }
+}
+
+/* scroll the view: delta > 0 = view older lines, < 0 = newer; 0 = live.
+ * History lines are blitted over the screen; returning to live redraws
+ * every row from the mirror (sb_view), which putc/gfx_cell keep current. */
+void gfx_sb_scroll(int delta)
+{
+    if (!gfx_on) return;
+    int off = sb_off + delta;
+    if (off < 0) off = 0;
+    if (off > sb_count) off = sb_count;
+    if (off == sb_off) return;
+    if (sb_off == 0 && delta > 0) {
+        /* DEBUG: dump the mirror text to serial on the first wheel-up */
+        for (int r = 0; r < 48; r++) {
+            serial_puts("[sb] ");
+            for (int c = 0; c < 100 && c < SB_COLS; c++) {
+                char ch = SB_CH(sb_view[r][c]);
+                serial_putc(ch >= ' ' && ch < 127 ? ch : '.');
+            }
+            serial_putc('\n');
+        }
+    }
+    sb_off = off;
+    if (sb_off == 0) {                       /* redraw the live screen */
+        for (int row = 0; row < 48; row++) sb_blit_line(row, sb_view[row]);
+        gfx_move_cursor();
+        return;
+    }
+    for (int row = 0; row < 48; row++) {
+        int back = sb_off + (47 - row);      /* lines back from the bottom */
+        if (back < 48) { sb_blit_line(row, sb_view[47 - back]); continue; }
+        int ring_back = back - 48;           /* 0 = newest ring entry */
+        if (ring_back >= sb_count) {
+            for (int c = 0; c < SB_COLS; c++) sb_blank[c] = SB_PACK(0, 0, ' ');
+            sb_blit_line(row, sb_blank);     /* older than memory: blank */
+            continue;
+        }
+        int idx = (sb_head - ring_back + SB_N * 4) % SB_N;
+        sb_blit_line(row, sb_ring[idx]);
+    }
+}
+
 int gfx_active(void) { return gfx_on; }
 int gfx_cols(void)   { return con_cols; }
 int gfx_rows(void)   { return con_rows; }
@@ -218,13 +321,15 @@ void gfx_cell(int cx, int cy, char ch, uint8_t fg_idx, uint8_t bg_idx)
 {
     if (!gfx_on || cx < 0 || cy < 0 || cx >= con_cols || cy >= con_rows) return;
     int x0 = cx * GLYPH_W, y0 = cy * GLYPH_H;
-    const uint8_t *g = font[(uint8_t)ch];
+    const uint8_t *g = font[(unsigned char)ch];
     uint32_t fg = pal[fg_idx & 0x0F], bg = pal[bg_idx & 0x0F];
     for (int r = 0; r < GLYPH_H; r++) {
         uint8_t bits = g[r];
         for (int b = 0; b < GLYPH_W; b++)
             px(x0 + b, y0 + r, (bits & (0x80 >> b)) ? fg : bg);
     }
+    /* keep the scrollback mirror consistent with fullscreen apps too */
+    if (cx < SB_COLS && cy < 48) sb_view[cy][cx] = SB_PACK(fg_idx, bg_idx, ch);
 }
 
 extern const uint8_t *cn_glyph(unsigned short code);   /* cnfont.c */
@@ -334,20 +439,23 @@ void gfx_putc(char c)
                                                  * cell that used to hold the
                                                  * cursor — newline writes no
                                                  * glyph here. */
+        sb_clear_tail(cur_y, cur_x);            /* mirror row is complete */
         cur_x = 0; cur_y++;
     } else if (c == '\r') {
         cur_x = 0;
     } else if (c == '\b') {
         if (cur_x > 0) cur_x--;
         draw_cell(cur_x, cur_y);                /* erase glyph + refresh bg */
+        sb_capture(cur_x, cur_y, ' ');
     } else if (c == '\v') {                     /* cursor left, keep the glyph */
         if (cur_x > 0) cur_x--;
     } else {
         put_cell_char(cur_x, cur_y, c);
+        sb_capture(cur_x, cur_y, c);
         cur_x++;
         if (cur_x >= con_cols) { cur_x = 0; cur_y++; }
     }
-    if (cur_y >= con_rows) { scroll(); cur_y = con_rows - 1; }
+    if (cur_y >= con_rows) { scroll(); sb_push_top(); cur_y = con_rows - 1; }
     gfx_move_cursor();
 }
 
@@ -373,7 +481,10 @@ void gfx_clear(void)
 {
     uint32_t n = (uint32_t)SCR_W * SCR_H;
     for (uint32_t i = 0; i < n; i++) fb[i] = bg_col;
+    for (int r = 0; r < 48; r++)
+        for (int c = 0; c < SB_COLS; c++) sb_view[r][c] = SB_PACK(fg_idx_cur, bg_idx_cur, ' ');
     cur_x = cur_y = 0;
+    sb_off = 0;
     gfx_move_cursor();
 }
 

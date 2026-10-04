@@ -33,6 +33,9 @@ void gfx_clear(void);
 void gfx_set_colors(uint8_t fg_idx, uint8_t bg_idx);   /* VGA 16-color idx */
 void gfx_set_bg_rgb(uint32_t rgb);  /* set raw RGB background (for BSOD) */
 void gfx_move_cursor(void);
+/* scrollback view (gfx console only): delta > 0 views older lines,
+ * < 0 newer, 0 returns to the live view. ~100 lines of history. */
+void gfx_sb_scroll(int delta);
 void gfx_grad_bar(void);   /* true-color gradient bar, one text row tall */
 /* draw one font glyph at pixel coords with integer scale */
 void gfx_blit_char(int px, int py, char ch, uint8_t fg_idx, int scale);
