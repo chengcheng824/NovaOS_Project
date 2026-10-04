@@ -4,7 +4,7 @@
  * RTC CMOS read only
  * ============================================================ */
 /* Bump on every feature update (the `ver` command prints it). */
-#define NOVAOS_VERSION "v0.7.2"
+#define NOVAOS_VERSION "v0.7.3"
 #include "stdint.h"
 #include "ata.h"
 #include "novafs.h"

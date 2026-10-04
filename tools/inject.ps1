@@ -4,6 +4,11 @@
 # For each NAME it injects the four slot binaries from build\:
 #   nxp_NAME0.bin -> NAME.nxp, nxp_NAME1.bin -> NAME.1.nxp, ...
 # The image is backed up to IMAGE.bak unless -NoBackup is given.
+#
+# NAMING NOTE: PowerShell variables are CASE-INSENSITIVE - never name a
+# parameter $ino while a script constant $INO exists (they collide, which
+# once wrote every inode update to a bogus offset and silently no-op'd
+# all injections).
 param(
     [string]$Image = 'data.img',
     [string]$Programs = '',
@@ -11,18 +16,21 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path $PSScriptRoot -Parent)
+# [IO.File]::* resolves relative paths against the .NET process working
+# directory, which does NOT follow Set-Location - pin everything absolute.
+$Image = (Join-Path (Get-Location).Path $Image)
 
-$SB  = 129 * 512
-$INO = 130 * 512
-$BMP = 162 * 512
-$DAT = 170 * 512
+$SB_OFF   = 129 * 512
+$INO_OFF  = 130 * 512
+$BMP_OFF  = 162 * 512
+$DAT_OFF  = 170 * 512
 $MAXBLOCKS = 32768
 $MAXINODES = 256
 
 if (-not (Test-Path $Image)) { Write-Host "[ERR] $Image not found" -ForegroundColor Red; exit 1 }
 $bytes = [IO.File]::ReadAllBytes($Image)
-if ($bytes.Length -lt ($DAT + $MAXBLOCKS * 512)) { Write-Host "[ERR] image too small" -ForegroundColor Red; exit 1 }
-$magic = [BitConverter]::ToUInt32($bytes, $SB)
+if ($bytes.Length -lt ($DAT_OFF + $MAXBLOCKS * 512)) { Write-Host "[ERR] image too small" -ForegroundColor Red; exit 1 }
+$magic = [BitConverter]::ToUInt32($bytes, $SB_OFF)
 if ($magic -ne 0x4E584653) { Write-Host "[ERR] not a NovaFS image (bad magic)" -ForegroundColor Red; exit 1 }
 
 if (-not $NoBackup) {
@@ -30,9 +38,9 @@ if (-not $NoBackup) {
     Write-Host "[inject] backup -> $Image.bak"
 }
 
-function Get-Bit([int]$i) { return (($bytes[$BMP + ($i -shr 3)] -shr ($i -band 7)) -band 1) }
-function Set-Bit([int]$i) { $bytes[$BMP + ($i -shr 3)] = $bytes[$BMP + ($i -shr 3)] -bor [byte](1 -shl ($i -band 7)) }
-function Clear-Bit([int]$i) { $bytes[$BMP + ($i -shr 3)] = $bytes[$BMP + ($i -shr 3)] -band [byte]([byte]255 -bxor (1 -shl ($i -band 7))) }
+function Get-Bit([int]$blk) { return (($bytes[$BMP_OFF + ($blk -shr 3)] -shr ($blk -band 7)) -band 1) }
+function Set-Bit([int]$blk) { $bytes[$BMP_OFF + ($blk -shr 3)] = $bytes[$BMP_OFF + ($blk -shr 3)] -bor [byte](1 -shl ($blk -band 7)) }
+function Clear-Bit([int]$blk) { $bytes[$BMP_OFF + ($blk -shr 3)] = $bytes[$BMP_OFF + ($blk -shr 3)] -band [byte]([byte]255 -bxor (1 -shl ($blk -band 7))) }
 
 function Get-FreeBlock {
     for ($b = 1; $b -lt $MAXBLOCKS; $b++) {
@@ -43,7 +51,7 @@ function Get-FreeBlock {
 
 function Get-FreeInode {
     for ($i = 1; $i -lt $MAXINODES; $i++) {
-        if ($bytes[$INO + $i * 64] -eq 0) { return $i }
+        if ($bytes[$INO_OFF + $i * 64] -eq 0) { return $i }
     }
     throw "no free inodes"
 }
@@ -51,7 +59,7 @@ function Get-FreeInode {
 function Find-Inode([string]$name) {
     $nb = [Text.Encoding]::ASCII.GetBytes($name)
     for ($i = 1; $i -lt $MAXINODES; $i++) {
-        $base = $INO + $i * 64
+        $base = $INO_OFF + $i * 64
         if ($bytes[$base] -ne 1) { continue }                       # T_FILE
         $parent = [BitConverter]::ToUInt16($bytes, $base + 2)
         if ($parent -ne 0) { continue }                             # root dir only
@@ -64,8 +72,8 @@ function Find-Inode([string]$name) {
     return -1
 }
 
-function Free-Blocks([int]$ino) {
-    $base = $INO + $ino * 64
+function Free-Blocks([int]$inode) {
+    $base = $INO_OFF + $inode * 64
     for ($b = 0; $b -lt 6; $b++) {
         $blk = [BitConverter]::ToUInt32($bytes, $base + 32 + $b * 4)
         if ($blk) { Clear-Bit $blk }
@@ -73,32 +81,32 @@ function Free-Blocks([int]$ino) {
     $ind = [BitConverter]::ToUInt32($bytes, $base + 56)
     if ($ind) {
         for ($e = 0; $e -lt 128; $e++) {
-            $blk = [BitConverter]::ToUInt32($bytes, $DAT + $ind * 512 + $e * 4)
+            $blk = [BitConverter]::ToUInt32($bytes, $DAT_OFF + $ind * 512 + $e * 4)
             if ($blk) { Clear-Bit $blk }
         }
         Clear-Bit $ind
     }
 }
 
-function Write-FileInode([int]$ino, [byte[]]$data) {
-    $base = $INO + $ino * 64
-    Free-Blocks $ino
+function Write-FileInode([int]$inode, [byte[]]$data) {
+    $base = $INO_OFF + $inode * 64
+    Free-Blocks $inode
     $nb = [Math]::Ceiling($data.Length / 512.0)
     for ($b = 0; $b -lt [Math]::Min(6, $nb); $b++) {
         $blk = Get-FreeBlock
         [BitConverter]::GetBytes([uint32]$blk).CopyTo($bytes, $base + 32 + $b * 4)
         $n = [Math]::Min(512, $data.Length - $b * 512)
-        [Array]::Copy($data, $b * 512, $bytes, $DAT + $blk * 512, $n)
+        [Array]::Copy($data, $b * 512, $bytes, $DAT_OFF + $blk * 512, $n)
     }
     if ($nb -gt 6) {
         $ind = Get-FreeBlock
         [BitConverter]::GetBytes([uint32]$ind).CopyTo($bytes, $base + 56)
-        [Array]::Clear($bytes, $DAT + $ind * 512, 512)
+        [Array]::Clear($bytes, $DAT_OFF + $ind * 512, 512)
         for ($b = 6; $b -lt $nb; $b++) {
             $blk = Get-FreeBlock
-            [BitConverter]::GetBytes([uint32]$blk).CopyTo($bytes, $DAT + $ind * 512 + ($b - 6) * 4)
+            [BitConverter]::GetBytes([uint32]$blk).CopyTo($bytes, $DAT_OFF + $ind * 512 + ($b - 6) * 4)
             $n = [Math]::Min(512, $data.Length - $b * 512)
-            [Array]::Copy($data, $b * 512, $bytes, $DAT + $blk * 512, $n)
+            [Array]::Copy($data, $b * 512, $bytes, $DAT_OFF + $blk * 512, $n)
         }
     }
     [BitConverter]::GetBytes([uint32]$data.Length).CopyTo($bytes, $base + 28)
@@ -106,21 +114,21 @@ function Write-FileInode([int]$ino, [byte[]]$data) {
 
 function Inject-File([string]$fname, [byte[]]$data) {
     if ($fname.Length -gt 23) { throw "name too long: $fname" }
-    $ino = Find-Inode $fname
-    if ($ino -lt 0) {
-        $ino = Get-FreeInode
-        $base = $INO + $ino * 64
+    $inode = Find-Inode $fname
+    if ($inode -lt 0) {
+        $inode = Get-FreeInode
+        $base = $INO_OFF + $inode * 64
         $bytes[$base + 0] = 1                                   # T_FILE
         $bytes[$base + 1] = 0                                   # owner: root
         [BitConverter]::GetBytes([uint16]0).CopyTo($bytes, $base + 2)
         $nb = [Text.Encoding]::ASCII.GetBytes($fname)
         [Array]::Clear($bytes, $base + 4, 24)
         [Array]::Copy($nb, 0, $bytes, $base + 4, $nb.Length)
-        Write-Host ("    + $fname (new inode {0})" -f $ino) -ForegroundColor Gray
+        Write-Host ("    + $fname (new inode {0})" -f $inode) -ForegroundColor Gray
     } else {
-        Write-Host ("    + $fname (replacing inode {0})" -f $ino) -ForegroundColor Gray
+        Write-Host ("    + $fname (replacing inode {0})" -f $inode) -ForegroundColor Gray
     }
-    Write-FileInode $ino $data
+    Write-FileInode $inode $data
 }
 
 $names = $Programs -split ',' | Where-Object { $_ }
@@ -141,4 +149,9 @@ foreach ($n in $names) {
 }
 
 [IO.File]::WriteAllBytes($Image, $bytes)
+$chk = [IO.File]::ReadAllBytes($Image)
+$memSize  = [BitConverter]::ToUInt32($bytes, $INO_OFF + 25 * 64 + 28)
+$diskSize = [BitConverter]::ToUInt32($chk,   $INO_OFF + 25 * 64 + 28)
+Write-Host ("[inject] verify: inode25 size in-memory = {0}, on-disk = {1}" -f $memSize, $diskSize)
+Write-Host ("[inject] wrote {0} bytes, file now {1} bytes" -f $bytes.Length, $chk.Length)
 Write-Host "[inject] OK -> $Image" -ForegroundColor Green
