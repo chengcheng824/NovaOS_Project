@@ -1,6 +1,6 @@
 # NovaOS
 
-一个简洁的 32 位 C 语言操作系统内核，带 **多用户登录**（开机认证 + 密码哈希 + 文件属主权限）、**Ring3 用户态**（分页 + TSS + IDT + int 0x80 syscall）、**抢占式多进程**（PIT 100Hz + Ring3-only 抢占 + 4 进程槽）、**.nsh 批处理脚本**（.bat 兼容语法，内核/Ring3 双引擎）、交互式 shell `NovaSh`（方向键行内编辑 + `↑↓` 历史命令）、**NovaFS**（256 inode / 多级目录 / 间接块 67KB 文件 / 递归删除 / 磁盘用量统计）、**运行时 ACPI/AML 解析关机**、**Bochs VBE 图形驱动（1024x768x32 真彩控制台）**、**e1000 网卡 + TCP/IP 网络栈**（DHCP / ICMP ping / DNS / UDP echo / **TCP + wget**）、**全屏 TUI**（`tui.nxp`：文件浏览器 / 任务监视 / 系统信息三面板）、**贪吃蛇**（第一个原生游戏）、**Windows BSOD 风格红屏崩溃页** 与美化启动画面，可用 QEMU 直接启动测试。（建议使用 QEMU 6.2，支持最好）
+一个简洁的 32 位 C 语言操作系统内核，带 **多用户登录**（开机认证 + 密码哈希 + 文件属主权限）、**Ring3 用户态**（分页 + TSS + IDT + int 0x80 syscall）、**抢占式多进程**（PIT 100Hz + Ring3-only 抢占 + 4 进程槽）、**.nsh 批处理脚本**（.bat 兼容语法，内核/Ring3 双引擎）、交互式 shell `NovaSh`（方向键行内编辑 + `↑↓` 历史命令）、**NovaFS**（256 inode / 多级目录 / 间接块 67KB 文件 / 递归删除 / 磁盘用量统计）、**运行时 ACPI/AML 解析关机**、**Bochs VBE 图形驱动（1024x768x32 真彩控制台）**、**e1000 网卡 + TCP/IP 网络栈**（DHCP / ICMP ping / DNS / UDP echo / **TCP + wget**）、**全屏 TUI**（`tui.nxp`：文件浏览器 / 任务监视 / 系统信息三面板）、**贪吃蛇**（第一个原生游戏）、**Windows BSOD 风格红屏崩溃页** 与真彩绘制的开机徽标（超新星八芒星 + 轨道环 + 加粗字标，见 kernel/gfx.c 的 gfx_boot_logo），可用 QEMU 直接启动测试。（建议使用 QEMU 6.2，支持最好）
 
 ## 目录结构
 

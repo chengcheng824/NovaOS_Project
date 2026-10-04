@@ -36,6 +36,8 @@ void gfx_move_cursor(void);
 /* scrollback view (gfx console only): delta > 0 views older lines,
  * < 0 newer, 0 returns to the live view. ~100 lines of history. */
 void gfx_sb_scroll(int delta);
+/* true-color boot emblem: supernova + wordmark, homes the cursor below */
+void gfx_boot_logo(void);
 void gfx_grad_bar(void);   /* true-color gradient bar, one text row tall */
 /* draw one font glyph at pixel coords with integer scale */
 void gfx_blit_char(int px, int py, char ch, uint8_t fg_idx, int scale);

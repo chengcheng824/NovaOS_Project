@@ -4,7 +4,7 @@
  * RTC CMOS read only
  * ============================================================ */
 /* Bump on every feature update (the `ver` command prints it). */
-#define NOVAOS_VERSION "v0.8"
+#define NOVAOS_VERSION "v0.8.1"
 #include "stdint.h"
 #include "ata.h"
 #include "novafs.h"
@@ -2452,30 +2452,20 @@ static void banner(void) {
         "\xDB   \xDB\xDB  \xDB\xDB\xDB\xDB    \xDB\xDB    \xDB    \xDB  \xDB\xDB\xDB\xDB   \xDB\xDB\xDB\xDB ",
     };
     vga_clear();
-    vga_grad_bar();
-    vga_putc('\n');
     if (gfx_active()) {
-        /* big logo: render the block-art lines at 2x scale, centered */
-        int wide = 41 * 16;                       /* longest line at scale 2 */
-        int x0 = (gfx_cols() * 8 - wide) / 2;
-        if (x0 < 0) x0 = 0;
-        for (int i = 0; i < 5; i++) {
-            const char *ln = logo[i];
-            int x = x0;
-            for (int k = 0; ln[k]; k++, x += 16)
-                gfx_blit_char(x, 32 + i * 32, ln[k], C_LCYAN, 2);
-        }
-        /* the 2x logo spans 10 text rows + 1 blank; advance the cursor */
-        for (int i = 0; i < 11; i++) vga_putc('\n');
+        /* true-color drawn emblem: supernova + wordmark (see gfx.c);
+         * self-contained - fills the canvas and draws its own top bar */
+        gfx_boot_logo();
     } else {
+        vga_grad_bar();
+        vga_putc('\n');
         set_color(C_LCYAN);
         for (int i = 0; i < 5; i++) { vga_center(logo[i]); vga_putc('\n'); }
-        vga_putc('\n');
+        set_color(C_LGRAY);
+        vga_center("a tiny 32-bit operating system"); vga_putc('\n');
+        set_color(C_DGRAY);
+        vga_center(__DATE__); vga_putc('\n');
     }
-    set_color(C_LGRAY);
-    vga_center("a tiny 32-bit operating system"); vga_putc('\n');
-    set_color(C_DGRAY);
-    vga_center(__DATE__); vga_putc('\n');
     vga_putc('\n');
     vga_grad_bar();
     vga_putc('\n');

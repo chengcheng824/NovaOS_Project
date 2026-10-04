@@ -315,6 +315,142 @@ void gfx_blit_char(int x0, int y0, char ch, uint8_t fg_idx, int scale)
     blit_core(x0, y0, ch, pal[fg_idx & 0x0F], scale);
 }
 
+/* ---------- boot logo (true-color drawn emblem) ----------
+ * Design: a supernova star-burst for "Nova" - layered halo, 16 tapered
+ * gradient rays, white-hot core, an orbit ring with a moon (the OS as
+ * the world around it), plus a bold "NovaOS" wordmark with shadow. */
+
+/* 256-scale sine, 0..90 degrees, rounded */
+static const short SB_SIN[91] = {
+    0,4,9,13,18,22,27,31,36,40,44,49,53,58,62,66,71,75,79,83,88,92,96,100,
+    104,108,112,116,120,124,128,132,136,139,143,147,150,154,158,161,165,168,
+    171,175,178,181,184,187,190,193,196,199,202,204,207,210,212,215,217,219,
+    222,224,226,228,230,232,234,236,237,239,241,242,243,245,246,247,248,249,
+    250,251,252,253,253,254,255,255,256,256,256
+};
+static int sb_sin(int deg)
+{
+    deg %= 360; if (deg < 0) deg += 360;
+    int sign = 1;
+    if (deg >= 180) { sign = -1; deg -= 180; }
+    if (deg > 90) deg = 180 - deg;
+    return sign * SB_SIN[deg];
+}
+static int sb_cos(int deg) { return sb_sin(deg + 90); }
+
+static void fill_circle(int cx, int cy, int r, uint32_t col)
+{
+    for (int dy = -r; dy <= r; dy++)
+        for (int dx = -r; dx <= r; dx++)
+            if (dx * dx + dy * dy <= r * r) px(cx + dx, cy + dy, col);
+}
+
+static uint32_t ray_mix(uint32_t a, uint32_t b, int t, int len)
+{
+    int r = (int)(((a >> 16) & 0xFF) * (len - t) + ((b >> 16) & 0xFF) * t) / len;
+    int g = (int)(((a >> 8) & 0xFF) * (len - t) + ((b >> 8) & 0xFF) * t) / len;
+    int bl = (int)((a & 0xFF) * (len - t) + (b & 0xFF) * t) / len;
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)bl;
+}
+
+static void ray(int cx, int cy, int deg, int len, int w0,
+                uint32_t hot, uint32_t cool)
+{
+    int dx = sb_cos(deg), dy = sb_sin(deg);
+    for (int t = 0; t <= len; t += 2) {
+        int r = 1 + w0 * (len - t) / len;
+        fill_circle(cx + (dx * t) / 256, cy + (dy * t) / 256, r,
+                    ray_mix(hot, cool, t, len));
+    }
+}
+
+/* draw only the set bits of a glyph in a raw color (no bg fill) */
+static void blit_rgb(int x0, int y0, char ch, uint32_t rgb, int scale)
+{
+    const uint8_t *g = font[(unsigned char)ch];
+    for (int r = 0; r < GLYPH_H; r++)
+        for (int b = 0; b < GLYPH_W; b++)
+            if (g[r] & (0x80 >> b))
+                for (int sy = 0; sy < scale; sy++)
+                    for (int sx = 0; sx < scale; sx++)
+                        px(x0 + b * scale + sx, y0 + r * scale + sy, rgb);
+}
+
+void gfx_boot_logo(void)
+{
+    if (!gfx_on) return;
+
+    /* full black canvas + top accent bar, self-contained layout */
+    cur_x = 0; cur_y = 0;
+    for (uint32_t i = 0; i < (uint32_t)SCR_W * SCR_H; i++) fb[i] = 0x000000;
+    gfx_grad_bar();                              /* top bar, cur_y -> 1 */
+
+    const int cx = 512, cy = 148;
+
+    /* layered halo */
+    fill_circle(cx, cy, 112, 0x04080E);
+    fill_circle(cx, cy, 92,  0x081019);
+    fill_circle(cx, cy, 72,  0x0D1B2A);
+    fill_circle(cx, cy, 52,  0x12263C);
+
+    /* orbit ring + moon (the OS as the world around the star) */
+    for (int d = 0; d < 360; d++) {
+        int x = cx + (152 * sb_cos(d)) / 256;
+        int y = cy + (40  * sb_sin(d)) / 256;
+        px(x, y, 0x1E4258); px(x + 1, y, 0x1A3A50);
+        px(x, y + 1, 0x163448); px(x + 1, y + 1, 0x122C40);
+    }
+    fill_circle(cx + (152 * sb_cos(335)) / 256, cy + (40 * sb_sin(335)) / 256,
+                4, 0x7FB8D8);
+
+    /* rays: the diagonal four first (dimmer), then the cross four on top
+     * so all eight read with equal weight */
+    for (int k = 0; k < 4; k++)
+        ray(cx, cy, 45 + k * 90, 92, 7, 0xC8ECFA, 0x14547A);
+    for (int k = 0; k < 4; k++)
+        ray(cx, cy, k * 90,     100, 8, 0xE4F8FF, 0x1B608A);
+    for (int k = 0; k < 8; k++)
+        ray(cx, cy, 22 + k * 45, 46, 4, 0x6FC8E8, 0x0E3E5C);
+
+    /* white-hot core */
+    fill_circle(cx, cy, 22, 0x0E3A58);
+    fill_circle(cx, cy, 16, 0x28A0D8);
+    fill_circle(cx, cy, 11, 0x9FE8FF);
+    fill_circle(cx, cy, 7,  0xFFFFFF);
+
+    /* sparkles */
+    fill_circle(cx - 96, cy - 58, 2, 0x6FD8FF);
+    fill_circle(cx + 84, cy - 70, 2, 0x4FB8E0);
+    fill_circle(cx + 110, cy + 12, 2, 0x6FD8FF);
+    fill_circle(cx - 112, cy + 26, 2, 0x3FA8D8);
+    fill_circle(cx + 52, cy + 96, 2, 0x4FB8E0);
+
+    /* wordmark: "NovaOS" at 4x with shadow + bold */
+    const char *wm = "NovaOS";
+    int scale = 4, gw = GLYPH_W * scale;         /* 32 px per glyph */
+    int x0 = (SCR_W - 6 * gw) / 2, y0 = 292;
+    for (int i = 0; wm[i]; i++)
+        blit_rgb(x0 + i * gw + 5, y0 + 5, wm[i], 0x00345A, scale);
+    for (int i = 0; wm[i]; i++) {
+        blit_rgb(x0 + i * gw,     y0, wm[i], 0xEAF6FF, scale);
+        blit_rgb(x0 + i * gw + 1, y0, wm[i], 0xEAF6FF, scale);
+    }
+
+    /* tagline + build date + accent underline */
+    const char *tag = "a tiny 32-bit operating system";
+    int tl = 0; while (tag[tl]) tl++;
+    gfx_text((SCR_W - tl * GLYPH_W) / 2, 378, tag, 0x9FC8DC);
+    const char *dt = __DATE__;
+    int dl = 0; while (dt[dl]) dl++;
+    gfx_text((SCR_W - dl * GLYPH_W) / 2, 400, dt, 0x5F7F92);
+    for (int x = SCR_W / 2 - 150; x < SCR_W / 2 + 150; x++) {
+        px(x, 428, 0x00B4E0); px(x, 429, 0x0090B8);
+    }
+
+    /* console cursor lands below the logo */
+    cur_x = 0; cur_y = 30;
+}
+
 /* cell-addressed glyph with explicit per-cell colors (TUI primitives).
  * Bypasses the text console entirely: no cursor, no scrolling. */
 void gfx_cell(int cx, int cy, char ch, uint8_t fg_idx, uint8_t bg_idx)
