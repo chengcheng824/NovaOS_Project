@@ -28,7 +28,7 @@ Write-Host ("    kernel.bin = {0} bytes"-f $binsize)-ForegroundColor Gray
 # separate persistent data disk (data.img, primary IDE slave, created once
 # by run.ps1 from data-seed.img). Rebuilding never touches user data.
 $kernelSecs=[Math]::Ceiling($binsize/512.0)
-if($kernelSecs -gt 126){ Write-Host "[ERR] kernel.bin ($binsize B) exceeds the 126-sector boot budget (LBA 3..128)"-ForegroundColor Red; exit 1 }
+if($kernelSecs -gt 182){ Write-Host "[ERR] kernel.bin ($binsize B) exceeds the 182-sector boot budget (LBA 3..184)"-ForegroundColor Red; exit 1 }
 $totalSecs=2048
 if(3+$kernelSecs+4 -gt $totalSecs){ $totalSecs = 3+$kernelSecs+4 }
 $d=New-Object byte[](512*$totalSecs)

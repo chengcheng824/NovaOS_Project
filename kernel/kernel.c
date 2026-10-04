@@ -4,7 +4,7 @@
  * RTC CMOS read only
  * ============================================================ */
 /* Bump on every feature update (the `ver` command prints it). */
-#define NOVAOS_VERSION "v0.8.1"
+#define NOVAOS_VERSION "v0.8.3"
 #include "stdint.h"
 #include "ata.h"
 #include "novafs.h"
@@ -1024,6 +1024,7 @@ static int nxp_api_spawn(const char *name)
 {
     if (!name || !*name) return -1;
     int slot = slot_from_name(name);
+    if (!proc_slot_free(slot)) return -2;        /* never overwrite a live image */
     if (nxp_load_slot(name, slot) < 0) return -1;
     return proc_spawn(slot, name);
 }
@@ -1239,17 +1240,32 @@ static int slot_from_name(const char *name)
  * into the slot; the rest of the 128 KB slot is zeroed as slack + BSS. */
 static int nxp_load_slot(const char *name, int slot)
 {
+    if (slot < 0 || slot > 3) return -1;
     if(!fs_is_ready()){ kputs("NovaFS not formatted. Use 'format'.\n"); return -1; }
     int sz = fs_size(name);
     if(sz < 5){ kputs("run: no such file\n"); return -1; }
-    if(!fs_may_exec(name)){ kputs("run: permission denied\n"); return -1; }
+    /* loading IS reading: both bits gate the run */
+    if(!fs_may_exec(name) || !fs_may_read(name)){
+        kputs("run: permission denied\n"); return -1;
+    }
+    /* a 4-slot stride is 128 KB and the image area is the first 124 KB;
+     * nothing legal can exceed that */
+    if(sz > 0x1F000 - 4){ kputs("run: program too large\n"); return -1; }
+
     uint8_t *dst = (uint8_t *)proc_slot_base(slot);
-    fs_read(name, dst, 0x1F000u);
+    /* zero the WHOLE 128 KB stride BEFORE reading: a failed or truncated
+     * read must never leave a previous program's bytes behind (a stale
+     * image passes the magic check and runs the wrong program), and no
+     * stale data may survive for the new process to stumble over */
+    for (uint32_t i = 0; i < 0x20000u; i++) dst[i] = 0;
+
+    int rd = fs_read(name, dst, 0x1F000u);
+    if (rd < 0)  { kputs("run: read error\n"); return -1; }
+    if (rd < sz) { kputs("run: read truncated (disk error?)\n"); return -1; }
+
     if(dst[0]!='N' || dst[1]!='X' || dst[2]!='P' || dst[3]!=1){
         kputs("run: not a .nxp program (bad magic - .nsh? try nsh.nxp)\n"); return -1;
     }
-    if(sz > 0x1F000) sz = 0x1F000;
-    for(int i = sz; i < 0x1F000; i++) dst[i] = 0;   /* slack + big BSS */
     return 0;
 }
 
@@ -1464,6 +1480,10 @@ static void cmd_run(const char *name)
     int nl = str_len(name);
     if (nl > 4 && str_eq(name + nl - 4, ".nsh")) { nsh_run_script(name); return; }
     int slot = slot_from_name(name);
+    if (!proc_slot_free(slot)){
+        kputs("run: slot busy - that program is already running (try name.1/2/3.nxp)\n");
+        return;
+    }
     if(nxp_load_slot(name, slot) < 0) return;
     int pid = proc_spawn(slot, name);
     if(pid < 0){ kputs("run: slot busy (try name.1/2/3.nxp)\n"); return; }

@@ -118,6 +118,10 @@ int proc_spawn(int slot, const char *name)
     p->fr[8]  = slot_base[slot] + 4;    /* entry eip             */
     p->fr[9]  = 0x1B;                   /* user cs               */
     p->fr[10] = 0x202;                  /* eflags, IF=1: preemptible */
+    /* scrub the 32KB stack window: a fresh process must never inherit
+     * another process's stale stack bytes (cross-process data leak) */
+    uint8_t *sb = (uint8_t *)(slot_stack[slot] - 0x8000u);
+    for (uint32_t i = 0; i < 0x8000u; i++) sb[i] = 0;
     *(uint32_t *)(slot_stack[slot] - 4) = g_nxp_exit_stub;
     p->fr[11] = slot_stack[slot] - 4;   /* esp: `ret` hits the exit stub */
     p->fr[12] = 0x23;                   /* user ss               */
@@ -128,6 +132,12 @@ int proc_spawn(int slot, const char *name)
     while (name && name[i] && i < 12) { p->name[i] = name[i]; i++; }
     p->name[i] = 0;
     return slot + 1;
+}
+
+/* 1 = the slot has no live process (call BEFORE overwriting its image) */
+int proc_slot_free(int slot)
+{
+    return (slot >= 0 && slot < NSLOT && g_pcb[slot].state == PST_FREE);
 }
 
 /* fill buf with "pid st name\n" lines for live processes; returns count

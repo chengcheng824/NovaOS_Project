@@ -22,12 +22,14 @@ KERNEL_OFF   equ 0x8400
 STAGE2_LBA   equ 1
 STAGE2_SECS  equ 2
 KERNEL_LBA   equ 3
-KERNEL_SECS  equ 126            ; total budget (LBA 3..128)
+KERNEL_SECS  equ 182            ; total budget (LBA 3..184, 93184 B)
 ; INT 13h DAP buffers cannot cross a 64K boundary: 0000:8400 tops out at
 ; 0xFFFF (62 sectors). Split the kernel load: low part -> 0000:8400,
 ; high part -> 1000:0000 (linear 0x10000, contiguous for stage2's copy).
+; The high buffer may hold up to 128 sectors before hitting 0x20000;
+; 120 keeps a safe margin.
 KERNEL_LO_SECS equ 62           ; 0x8400 .. 0xFFFF
-KERNEL_HI_SECS equ 64           ; 0x10000 .. 0x17FFF
+KERNEL_HI_SECS equ 120          ; 0x10000 .. 0x1DFFF
 KERNEL_HI_LBA  equ 65
 
 start:

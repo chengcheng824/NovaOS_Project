@@ -36,6 +36,8 @@ void jmp_user(uint32_t *fr);
 
 /* ---- slot-based processes (4 slots, one address space) ---- */
 int  proc_spawn(int slot, const char *name);   /* pid = slot+1, -1 = busy  */
+int  proc_slot_free(int slot);                 /* 1 = idle (check BEFORE
+                                                  overwriting the image)  */
 uint32_t *proc_frame(int slot);                /* iret frame for jmp_user  */
 uint32_t proc_slot_base(int slot);             /* link base of slot        */
 int  proc_list(char *buf, uint32_t max);       /* "pid st name\n" lines    */

@@ -249,7 +249,8 @@ static int exec_line(char *l, int silent)
             return 0;
         }
         int pid = API->spawn(args);                 /* .nxp: new process */
-        if (pid < 0) { ps("spawn fail\n"); return 0; }
+        if (pid == -2) { ps("slot busy - that program is already running\n"); return 0; }
+        if (pid < 0) { ps("spawn fail (bad file? no slot?)\n"); return 0; }
         ps("pid "); pdec((u32)pid); p('\n');
         return 0;
     }
