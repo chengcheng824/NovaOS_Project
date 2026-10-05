@@ -465,7 +465,7 @@ typedef struct {
   创建者的 uid；非 root 对他人对象的写入/删除操作返回权限错误（`/passwd` 豁免）
 - **权限模式字节**在 `pad[4]`（高 4 位属主 rwx、低 4 位其他人 rwx，0 = 默认 `rwxr-x`），
   `fs_chmod()` 修改，`may_read/may_exec/may_modify` 在 cat/readfile/run/cd/write/rm 路径强制
-- 每次 inode / bitmap 变动都通过 ATA PIO `ata_write()` 写回磁盘，**持久化**
+- 每次 inode / bitmap 变动都通过 ATA PIO `ata_write()` 写回磁盘，**持久化**；`n` 所有块指针在读取/释放前做范围验证（越界一律拒绝而非释放），`ata_read/write` 返回值全检查，写失败保留已写前缀并正确释放间接链，挂载时做 inode 类型体检（损坏 → FAIL + 提示 format），超级块读取带 3 次重试（防数据盘未转好）
 - 账户库 `/passwd` 就是根目录下的普通文件（多行 `用户名:哈希`），随 NovaFS 持久化
 
 ## 内存布局

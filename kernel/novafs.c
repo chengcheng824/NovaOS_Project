@@ -25,6 +25,7 @@ static uint8_t   sb_sec[FS_BLOCK_SIZE];
 #define sb (*(super_t *)sb_sec)
 static inode_t   inode_tab[FS_MAX_INODES];
 static uint8_t   bmap[FS_BMAP_SECS*512];
+static uint8_t   ib_sec[FS_BLOCK_SIZE];  /* shared indirect-block scratch */
 static int       fs_ready = 0;
 static int       cwdir = 0;  /* current working directory inode (0 = root) */
 static uint8_t   cur_uid = 0; /* owner uid stamped onto newly created inodes */
@@ -97,6 +98,13 @@ static void bmap_free(int b){
  * read back as "no indirect block" - fully backward compatible. */
 #define NINDIR (FS_BLOCK_SIZE / 4)
 
+/* A corrupt inode must never aim ATA transfers or bitmap frees at a
+ * block outside the data region - that would read garbage or corrupt
+ * the bitmap/superblock. Block 0 is the "none" terminator. */
+static int blk_ok(uint32_t blk){
+    return blk >= 1 && blk < FS_MAX_BLOCKS;
+}
+
 static uint32_t get_indir(const inode_t *in){
     return (uint32_t)in->pad[0] | ((uint32_t)in->pad[1] << 8)
          | ((uint32_t)in->pad[2] << 16) | ((uint32_t)in->pad[3] << 24);
@@ -108,22 +116,26 @@ static void set_indir(inode_t *in, uint32_t blk){
     in->pad[3] = (uint8_t)(blk >> 24);
 }
 
-/* free every block of an inode: 6 direct + the indirect chain */
+/* free every block of an inode: 6 direct + the indirect chain.
+ * Out-of-range pointers are skipped (never freed): freeing them would
+ * flip bitmap bits owned by someone else and amplify the corruption. */
 static void free_blocks(inode_t *in){
     for(int b = 0; b < NDIRECT; b++){
-        if(in->block[b]){ bmap_free((int)in->block[b]); in->block[b] = 0; }
+        if(in->block[b]){
+            if(blk_ok(in->block[b])) bmap_free((int)in->block[b]);
+            in->block[b] = 0;
+        }
     }
     uint32_t ind = get_indir(in);
     if(ind){
-        static uint8_t ib[FS_BLOCK_SIZE];
-        if(ata_read(FS_DATA_LBA + ind, ib, 1) == 0){
+        if(blk_ok(ind) && ata_read(FS_DATA_LBA + ind, ib_sec, 1) == 0){
             for(int i = 0; i < NINDIR; i++){
                 uint32_t blk;
-                nx_memcpy(&blk, ib + i*4, 4);
-                if(blk) bmap_free((int)blk);
+                nx_memcpy(&blk, ib_sec + i*4, 4);
+                if(blk_ok(blk)) bmap_free((int)blk);
             }
         }
-        bmap_free((int)ind);
+        if(blk_ok(ind)) bmap_free((int)ind);
         set_indir(in, 0);
     }
 }
@@ -147,7 +159,7 @@ static void clear_inode(int idx){
 }
 
 /* ---------- public API ---------- */
-int fs_init(void){
+static int fs_init_once(void){
     ata_set_slave(1);   /* NovaFS on the primary slave data disk, not the boot disk */
     if(ata_read(FS_SUPER_LBA, (uint8_t*)&sb, 1) < 0) return -1;
     /* Auto-format on first boot / old layout disk. User never wants to
@@ -159,10 +171,27 @@ int fs_init(void){
     }
     if(load_inode_table() < 0) return -3;
     if(load_bmap() < 0) return -4;
+    /* metadata sanity: refuse to serve a corrupt inode table instead of
+     * pointing ATA transfers at arbitrary sectors. -5 = "format needed". */
+    if(inode_tab[0].type != T_DIR) return -5;
+    for(int i = 1; i < FS_MAX_INODES; i++)
+        if(inode_tab[i].type > T_DIR) return -5;
     bmap[0] |= 1;
     fs_ready = 1;
     cwdir = 0;
     return 0;
+}
+
+int fs_init(void){
+    /* -1 = transport-level superblock read failed: the data disk may
+     * still be spinning up at boot. Retry before giving up. */
+    int r = -1;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        r = fs_init_once();
+        if (r != -1) return r;
+        for (volatile uint32_t d = 0; d < 4000000u; d++) { }   /* ~settle */
+    }
+    return r;
 }
 
 int fs_is_ready(void){ return fs_ready; }
@@ -472,9 +501,35 @@ int fs_write(const char *name, const uint8_t *data, uint32_t len){
         uint32_t n = len - b*FS_BLOCK_SIZE;
         if(n > FS_BLOCK_SIZE) n = FS_BLOCK_SIZE;
         nx_memcpy(buf, data + b*FS_BLOCK_SIZE, (int)n);
-        ata_write(FS_DATA_LBA + blk, buf, 1);
+        if(ata_write(FS_DATA_LBA + blk, buf, 1) < 0){
+            /* write failed: keep only the fully written prefix */
+            in->size = b * FS_BLOCK_SIZE;
+            if(ind){
+                for(uint32_t k = ind_used; k < NINDIR; k++){
+                    uint32_t z = 0;
+                    nx_memcpy(ibuf + k*4, &z, 4);
+                }
+                ata_write(FS_DATA_LBA + ind, ibuf, 1);
+            }
+            store_inode_table(); store_bmap();
+            return -1;
+        }
     }
-    if(ind) ata_write(FS_DATA_LBA + ind, ibuf, 1);   /* persist the chain */
+    if(ind && ata_write(FS_DATA_LBA + ind, ibuf, 1) < 0){
+        /* the chain block itself failed: drop the indirect arm entirely,
+         * freeing its entries from the in-memory ibuf (the on-disk copy
+         * is stale and must not be walked by a later free_blocks) */
+        for(uint32_t k = 0; k < ind_used; k++){
+            uint32_t blk;
+            nx_memcpy(&blk, ibuf + k*4, 4);
+            if(blk_ok(blk)) bmap_free((int)blk);
+        }
+        bmap_free((int)ind);
+        set_indir(in, 0);
+        in->size = (uint32_t)(NDIRECT * FS_BLOCK_SIZE < len ? NDIRECT * FS_BLOCK_SIZE : len);
+        store_inode_table(); store_bmap();
+        return -1;
+    }
     in->size = len;
     store_inode_table();
     store_bmap();
@@ -495,20 +550,22 @@ int fs_read(const char *name, uint8_t *buf, uint32_t max){
     uint32_t off = 0;
     for(uint32_t b=0; b<need && b<NDIRECT && off < n; b++){
         if(in->block[b] == 0) break;
-        ata_read(FS_DATA_LBA + in->block[b], blkbuf, 1);
+        if(!blk_ok(in->block[b])) return -3;          /* corrupt pointer */
+        if(ata_read(FS_DATA_LBA + in->block[b], blkbuf, 1) < 0) return -3;
         for(uint32_t i=0;i<FS_BLOCK_SIZE && off<n;i++){
             buf[off++] = blkbuf[i];
         }
     }
     uint32_t ind = get_indir(in);            /* indirect chain */
     if(ind && off < n){
-        static uint8_t ibuf[FS_BLOCK_SIZE];
-        ata_read(FS_DATA_LBA + ind, ibuf, 1);
+        if(!blk_ok(ind)) return -3;
+        if(ata_read(FS_DATA_LBA + ind, ib_sec, 1) < 0) return -3;
         for(uint32_t i = 0; i < NINDIR && off < n; i++){
             uint32_t blk;
-            nx_memcpy(&blk, ibuf + i*4, 4);
+            nx_memcpy(&blk, ib_sec + i*4, 4);
             if(!blk) break;
-            ata_read(FS_DATA_LBA + blk, blkbuf, 1);
+            if(!blk_ok(blk)) return -3;
+            if(ata_read(FS_DATA_LBA + blk, blkbuf, 1) < 0) return -3;
             for(uint32_t k=0;k<FS_BLOCK_SIZE && off<n;k++){
                 buf[off++] = blkbuf[k];
             }

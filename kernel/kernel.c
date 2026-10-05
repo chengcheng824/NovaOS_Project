@@ -4,7 +4,7 @@
  * RTC CMOS read only
  * ============================================================ */
 /* Bump on every feature update (the `ver` command prints it). */
-#define NOVAOS_VERSION "v0.8.3"
+#define NOVAOS_VERSION "v0.8.4"
 #include "stdint.h"
 #include "ata.h"
 #include "novafs.h"
@@ -2533,9 +2533,22 @@ void kmain(void) {
     }
 
     if (!g_quiet) {
-        if (fr == 0)      boot_tag(1, "novafs", "mounted");
-        else if (fr == 1) boot_tag(1, "novafs", "fresh disk, auto-formatted");
-        else              boot_tag(0, "novafs", "disk I/O error");
+    if (fr == 0)      boot_tag(1, "novafs", "mounted");
+    else if (fr == 1) boot_tag(1, "novafs", "fresh disk, auto-formatted");
+    else if (fr == -5) boot_tag(0, "novafs", "corrupt metadata - 'format' resets");
+    else {
+        char b[40]; char *e = b;
+        const char *l = "disk I/O error (fs_init ";
+        while (*l) *e++ = *l++;
+        if (fr < 0) { *e++ = '-'; }
+        unsigned v = (unsigned)(fr < 0 ? -fr : fr);
+        char nb[12]; int ni = 0;
+        if (!v) nb[ni++] = '0';
+        while (v) { nb[ni++] = (char)('0' + v % 10); v /= 10; }
+        while (ni) *e++ = nb[--ni];
+        *e++ = ')'; *e = 0;
+        boot_tag(0, "novafs", b);
+    }
         boot_tag(1, "feat",  "feature subsystem (/etc/features.conf)");
     }
 
